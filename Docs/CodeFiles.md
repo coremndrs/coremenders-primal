@@ -7,14 +7,14 @@ drift — treat this file as a *map*, not a metric.
 Not listed: Unity's `TutorialInfo/` sample scripts (`Readme.cs`,
 `Editor/ReadmeEditor.cs`), which ship with the template and are not ours.
 
-**Totals:** 100 `.cs` files + 5 `.asmdef` files, 12,151 lines.
+**Totals:** 99 `.cs` files + 5 `.asmdef` files, 12,151 lines.
 
 | Assembly | Files | Lines | References |
 |---|---|---|---|
 | `Game.Simulation` | 43 | 2,120 | *(none — `noEngineReferences: true`)* |
 | `Game.Persistence` | 4 | 272 | Simulation |
-| `Game.Networking` | 34 | 7,677 | Simulation + NGO |
-| `Game.Presentation` | 7 | 630 | Simulation + Networking + Persistence |
+| `Game.Networking` | 33 | 7,673 | Simulation + NGO |
+| `Game.Presentation` | 7 | 634 | Simulation + Networking + Persistence |
 | `Game.Editor` | 12 | 1,452 | *(editor-only tooling)* |
 
 ---
@@ -136,7 +136,7 @@ Not listed: Unity's `TutorialInfo/` sample scripts (`Readme.cs`,
 | [DebugAutoConnect.cs](../Game/Networking/DebugAutoConnect.cs) | 54 | Debug bootstrap for SampleScene — bypasses the real scene flow. |
 | [HostJoinController.cs](../Game/Networking/HostJoinController.cs) | 18 | Pre-network UI for the HostJoin scene; delegates to `GameFlowManager`. |
 | [CharacterCreationController.cs](../Game/Networking/CharacterCreationController.cs) | 146 | In-scene NetworkBehaviour for the CharacterCreation scene. |
-| [DreamerCreationUI.cs](../Game/Networking/DreamerCreationUI.cs) | 69 | *Legacy* — Build 0.0.1b creation UI, superseded at 0.0.1c. |
+| [DreamerCreationUI.cs](../Game/Networking/DreamerCreationUI.cs) | 69 | *Legacy, pending deletion* — Build 0.0.1b creation UI, superseded at 0.0.1c. Still bound to a GameObject in `BootstrapScene.unity`; see `TODO.md`. |
 | [PauseMenuController.cs](../Game/Networking/PauseMenuController.cs) | 82 | Escape opens/closes the in-game menu; does not stop the clock. |
 | [UiFocus.cs](../Game/Networking/UiFocus.cs) | 51 | Process-wide "a panel wants the mouse" claim registry (FP build, B b2). |
 
@@ -168,7 +168,6 @@ Not listed: Unity's `TutorialInfo/` sample scripts (`Readme.cs`,
 | [MapEntitySync.cs](../Game/Networking/MapEntitySync.cs) | 1291 | Variable-length full-state payload for a map's unified world-object collection (0.2.7a). |
 | [Interactable.cs](../Game/Networking/Interactable.cs) | 57 | Placed on any interactable world prefab (TDD §1.12, 0.2.9c2). |
 | [InteractableDetector.cs](../Game/Networking/InteractableDetector.cs) | 216 | Per-dreamer look-target resolution and prompt presentation. |
-| [WorldItemsSync.cs](../Game/Networking/WorldItemsSync.cs) | 4 | **Obsolete stub** — replaced by `MapEntitySync` at 0.2.7a; delete after the component swap. |
 
 ### Definitions (ScriptableObjects & registries)
 
@@ -204,7 +203,7 @@ Not listed: Unity's `TutorialInfo/` sample scripts (`Readme.cs`,
 | [FirstPerson/SelfBodyVisibility.cs](../Game/Presentation/FirstPerson/SelfBodyVisibility.cs) | 64 | FP Group F — owner never sees their own body but still casts a shadow. |
 | [MainMenuController.cs](../Game/Presentation/MainMenuController.cs) | 31 | Main menu, three entry points (D7). |
 | [SplashController.cs](../Game/Presentation/SplashController.cs) | 15 | Timed splash → MainMenu. |
-| [Settings/GameSettingsApplier.cs](../Game/Presentation/Settings/GameSettingsApplier.cs) | 30 | `DontDestroyOnLoad` frame-rate cap applier, re-applied per scene load. |
+| [Settings/GameSettingsApplier.cs](../Game/Presentation/Settings/GameSettingsApplier.cs) | 34 | `DontDestroyOnLoad` frame-rate cap applier, re-applied per scene load. |
 
 ---
 
@@ -238,12 +237,17 @@ Not listed: Unity's `TutorialInfo/` sample scripts (`Readme.cs`,
 
 ## Notes
 
-- **`WorldItemsSync.cs`** is a 4-line namespace stub left as a deletion reminder;
-  the live path is `MapEntitySync`. See its header comment for the swap steps.
-- **`DreamerCreationUI.cs`** is superseded by `CharacterCreationController` and
-  kept only for the 0.0.1b debug path.
-- **`GameSettingsApplier`** sits outside the `Game.Presentation` namespace (it is
-  in the global namespace) — an outstanding inconsistency with the
-  `Game.<Layer>` convention.
+- **`WorldItemsSync.cs`** — deleted. It was a 4-line namespace stub kept as a
+  deletion reminder; a GUID search found no scene, prefab or `.asset` reference,
+  so it and its `.meta` were removed. The live path is `MapEntitySync`.
+- **`DreamerCreationUI.cs`** — superseded by `CharacterCreationController`, but
+  **not** deletable yet: its GUID is still bound to the root `DreamerCreationUI`
+  GameObject in `Assets/Game/Scenes/BootstrapScene.unity`. Removing the script
+  first would leave a missing-script component. Logged in `TODO.md` with the
+  Editor steps to clear it.
+- **`GameSettingsApplier`** — now wrapped in `namespace Game.Presentation`, in
+  line with the `Game.<Layer>` convention. It still lacks the rule-6
+  `ResetStatics()` guard required of every `public static … Instance` holder
+  (see CLAUDE.md, NGO lifecycle rule 6).
 - The two biggest files, `DreamerInventorySync.cs` (1383) and
   `MapEntitySync.cs` (1291), together account for ~21% of the codebase.
