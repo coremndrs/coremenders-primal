@@ -1,0 +1,36 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 16aab93755b33344b80f4f168c4df11e, type: 3}
+  m_Name: Def_BasicWorkStation
+  m_EditorClassIdentifier: 
+  defId: 1009
+  displayName: Basic Workbench
+  prefab: {fileID: 1665282605212667803, guid: 1bdb7be19a6924c498d5c337da5d45dd, type: 3}
+  aspects: []
+  actions:
+  - action: {fileID: 11400000, guid: 4f1942a9bd572434288d6888d25b5ae9, type: 2}
+    labelOverride: 
+    timeRequired: 60
+    coop: 0
+    interruptsSkip: 0
+    yieldModel: 0
+    yields: []
+    payoutDestination: 0
+    onDepletion: 0
+    depletionSpawns: []
+    effects: []
+    allowedToolCategoryIds: 
+    toolRequired: 0
+    prerequisite: {fileID: 0}
+  references:
+    version: 2
+    RefIds: []

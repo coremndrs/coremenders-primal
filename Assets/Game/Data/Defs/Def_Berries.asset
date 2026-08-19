@@ -1,0 +1,76 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 16aab93755b33344b80f4f168c4df11e, type: 3}
+  m_Name: Def_Berries
+  m_EditorClassIdentifier: 
+  defId: 4
+  displayName: Berries
+  prefab: {fileID: 4118521114434105237, guid: f413eee38260e5e418f88d3b7b23bbd8, type: 3}
+  aspects:
+  - rid: 365121865637167170
+  - rid: 365121865637167171
+  - rid: 365121865637167172
+  actions:
+  - action: {fileID: 11400000, guid: 21b4ed4eec758f445be3340143e6b0a4, type: 2}
+    labelOverride: 
+    timeRequired: 0
+    coop: 1
+    interruptsSkip: 0
+    yieldModel: 1
+    yields: []
+    payoutDestination: 0
+    onDepletion: 0
+    depletionSpawns: []
+    effects: []
+    allowedToolCategoryIds: 
+    toolRequired: 0
+    prerequisite: {fileID: 0}
+  - action: {fileID: 0}
+    labelOverride: 
+    timeRequired: 0
+    coop: 1
+    interruptsSkip: 0
+    yieldModel: 1
+    yields: []
+    payoutDestination: 0
+    onDepletion: 0
+    depletionSpawns: []
+    effects: []
+    allowedToolCategoryIds: 
+    toolRequired: 0
+    prerequisite: {fileID: 0}
+  references:
+    version: 2
+    RefIds:
+    - rid: 365121865637167170
+      type: {class: InventoryAspect, ns: Game.Simulation, asm: Game.Simulation}
+      data:
+        category: 1
+        weight: 1
+        stackable: 1
+        maxStack: 64
+        itemTypeTag: 8
+    - rid: 365121865637167171
+      type: {class: ConsumableAspect, ns: Game.Simulation, asm: Game.Simulation}
+      data:
+        consumeEffect: 1
+        hungerRestore: 40
+        thirstRestore: 5
+        timeCost: 5
+        energyCost: 1
+        allowsOverdraft: 0
+        payoutShape: 0
+        interruptsSkip: 0
+    - rid: 365121865637167172
+      type: {class: PerishableAspect, ns: Game.Simulation, asm: Game.Simulation}
+      data:
+        effectiveLifespan: 240

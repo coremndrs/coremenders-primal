@@ -1,0 +1,34 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9c084bde5d93507459b22ae45a98f774, type: 3}
+  m_Name: Recipe_Crude_Torch
+  m_EditorClassIdentifier: 
+  recipeId: 1
+  displayName: Crude Torch
+  inputs:
+  - itemDefId: 11
+    amount: 2
+  - itemDefId: 4
+    amount: 2
+  requiredToolCategoryId: 1
+  requiredStationDefId: 0
+  timeCost: 30
+  energyCost: 5
+  requiredLabor: 0
+  energyPerMinute: 0
+  coop: 0
+  unlockConditionId: 0
+  outputAmount: 1
+  tierTable:
+  - outputDefId: 1004
+    weight: 1
+  rollGranularity: 1

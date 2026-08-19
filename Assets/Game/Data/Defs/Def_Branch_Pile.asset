@@ -1,0 +1,62 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 16aab93755b33344b80f4f168c4df11e, type: 3}
+  m_Name: Def_Branch_Pile
+  m_EditorClassIdentifier: 
+  defId: 1002
+  displayName: Branch Pile
+  prefab: {fileID: 1191177741575361047, guid: 10b60114bec6cd0468463704428cc61b, type: 3}
+  aspects: []
+  actions:
+  - action: {fileID: 11400000, guid: 90a77785b8c3ddb41bf37e2d933e7e63, type: 2}
+    labelOverride: gather sticks
+    timeRequired: 3
+    coop: 1
+    interruptsSkip: 0
+    yieldModel: 1
+    yields:
+    - isWorldObject: 0
+      itemDefId: 11
+      worldObjectDefId: 0
+      amount: 5
+    payoutDestination: 0
+    onDepletion: 0
+    depletionSpawns: []
+    effects:
+    - stat: 0
+      amount: -6
+    allowedToolCategoryIds: 
+    toolRequired: 0
+    prerequisite: {fileID: 0}
+  - action: {fileID: 11400000, guid: 90a77785b8c3ddb41bf37e2d933e7e63, type: 2}
+    labelOverride: gather firewood
+    timeRequired: 5
+    coop: 1
+    interruptsSkip: 0
+    yieldModel: 1
+    yields:
+    - isWorldObject: 0
+      itemDefId: 12
+      worldObjectDefId: 0
+      amount: 3
+    payoutDestination: 0
+    onDepletion: 0
+    depletionSpawns: []
+    effects:
+    - stat: 0
+      amount: -10
+    allowedToolCategoryIds: 01000000
+    toolRequired: 1
+    prerequisite: {fileID: 0}
+  references:
+    version: 2
+    RefIds: []

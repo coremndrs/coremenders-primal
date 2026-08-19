@@ -1,0 +1,38 @@
+# Normalise line endings in the repo, check out native on each platform.
+* text=auto
+
+# Unity writes LF in its YAML and meta files on every platform.
+*.unity      text eol=lf
+*.prefab     text eol=lf
+*.asset      text eol=lf
+*.mat        text eol=lf
+*.controller text eol=lf
+*.anim       text eol=lf
+*.meta       text eol=lf
+*.asmdef     text eol=lf
+*.asmref     text eol=lf
+
+*.cs   text diff=csharp
+*.json text
+*.md   text
+*.yml  text
+
+# Unity SmartMerge (UnityYAMLMerge) — see Phase 8 for the git config
+*.unity      merge=unityyamlmerge
+*.prefab     merge=unityyamlmerge
+*.asset      merge=unityyamlmerge
+*.mat        merge=unityyamlmerge
+*.controller merge=unityyamlmerge
+*.anim       merge=unityyamlmerge
+
+# Tracked small binaries — no diff, no EOL conversion
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.ttf  binary
+*.otf  binary
+*.dll  binary
+*.so   binary
+*.pdf  binary

@@ -1,0 +1,42 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 16aab93755b33344b80f4f168c4df11e, type: 3}
+  m_Name: Def_Test_Tree
+  m_EditorClassIdentifier: 
+  defId: 1011
+  displayName: Test Tree
+  prefab: {fileID: 7604396543549365465, guid: 2a01d4bd937510446b04e9f059a58e4a, type: 3}
+  aspects: []
+  actions:
+  - action: {fileID: 11400000, guid: e93b3b7a60b46624e823f7554f6eb603, type: 2}
+    labelOverride: Chop Tree
+    timeRequired: 30
+    coop: 1
+    interruptsSkip: 0
+    yieldModel: 1
+    yields: []
+    payoutDestination: 1
+    onDepletion: 1
+    depletionSpawns:
+    - isWorldObject: 1
+      itemDefId: 0
+      worldObjectDefId: 1001
+      amount: 1
+    effects:
+    - stat: 0
+      amount: -20
+    allowedToolCategoryIds: 01000000
+    toolRequired: 1
+    prerequisite: {fileID: 0}
+  references:
+    version: 2
+    RefIds: []

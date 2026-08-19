@@ -1,0 +1,20 @@
+{
+    "name": "Game.Networking",
+    "rootNamespace": "",
+    "references": [
+        "GUID:1269266dac747a04f837384e41216603",
+        "GUID:1491147abca9d7d4bb7105af628b223e",
+        "GUID:0d0243c226d5dab4fb5d34006a1ad53b",
+        "GUID:767f25efd20d4339a8b1683f8dc1d7d8",
+        "GUID:908954e6ce23cdc478e6af7faf3eeaba"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

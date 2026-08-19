@@ -1,0 +1,124 @@
+# ─────────────────────────────────────────────────────────────
+# Unity — generated / regenerable. Never commit these.
+# ─────────────────────────────────────────────────────────────
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+sysinfo.txt
+crashlytics-build.properties
+
+# Never ignore these — the project does not reproduce without them
+!Packages/
+!ProjectSettings/
+
+# ─────────────────────────────────────────────────────────────
+# IDE / tooling
+# ─────────────────────────────────────────────────────────────
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.tmp
+
+# ─────────────────────────────────────────────────────────────
+# OS cruft
+# ─────────────────────────────────────────────────────────────
+.DS_Store*
+Thumbs.db
+desktop.ini
+
+# ─────────────────────────────────────────────────────────────
+# Build output
+# ─────────────────────────────────────────────────────────────
+*.apk
+*.aab
+*.app
+*.unitypackage
+
+# ─────────────────────────────────────────────────────────────
+# Heavy binary content — lives in restic archives, not in git.
+# See Docs/VersionControl.md. Git LFS is deliberately NOT used.
+#
+# The trailing * on each pattern also catches the sibling .meta
+# file: "*.psd*" matches both hero.psd and hero.psd.meta.
+# Ignored assets and their metas always travel together.
+# ─────────────────────────────────────────────────────────────
+
+# Source art
+*.psd*
+*.psb*
+*.blend*
+*.max*
+*.ztl*
+*.spp*
+*.sbs*
+*.xcf*
+
+# Maya — listed explicitly, NOT as *.ma* / *.mb*. Those short patterns
+# would also swallow Unity's own .mat, .mask and .mixer assets, which
+# must stay tracked.
+*.ma
+*.ma.meta
+*.mb
+*.mb.meta
+
+# Large image formats
+*.exr*
+*.tga*
+*.tif*
+*.tiff*
+*.hdr*
+
+# Models
+*.fbx*
+*.obj*
+*.dae*
+*.3ds*
+
+# Audio
+*.wav*
+*.aif*
+*.aiff*
+*.mp3*
+*.ogg*
+*.flac*
+
+# Video
+*.mp4*
+*.mov*
+*.avi*
+*.webm*
+
+# ─────────────────────────────────────────────────────────────
+# Exceptions: small, stable assets worth tracking.
+# Add entries here with a comment explaining why. Do not loosen
+# the rules above instead.
+# ─────────────────────────────────────────────────────────────
+# Example:
+# !Assets/Audio/UI/click.wav
+# !Assets/Audio/UI/click.wav.meta
+
+# ─────────────────────────────────────────────────────────────
+# Claude Code — machine-local settings. The skills under
+# .claude/skills/ ARE tracked so they travel with the project;
+# only the personal permission allowlist is excluded.
+# ─────────────────────────────────────────────────────────────
+.claude/settings.local.json

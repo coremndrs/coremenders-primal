@@ -1,0 +1,21 @@
+{
+    "slot": 1,
+    "position": { "x": 2.0, "y": 0.0, "z": 0.0 },
+    "appearance": { "skinTone": 0, "hairStyle": 0, "hairColor": 0 },
+    "needs": { "hunger": 100.0, "thirst": 100.0, "warmth": 100.0 },
+    "energy": 80.0,
+    "task": { "type": 0, "durationMinutes": 0.0, "elapsedMinutes": 0.0 },
+    "vitality": 100.0,
+    "afflictions": { "isStarving": false, "isDehydrated": false, "isHypothermic": false },
+    "isIncapacitated": false,
+    "buffs": [],
+    "nightmareTier": 0,
+    "equipSlots": {
+        "backpack": null,
+        "pouch0": null,
+        "pouch1": null,
+        "quiver": null
+    },
+    "timePool": 1440.0,
+    "actionQueue": []
+}

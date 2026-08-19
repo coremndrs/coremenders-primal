@@ -1,0 +1,11 @@
+{
+    "schemaVersion": 19,
+    "mapId": "map_01",
+    "clock": {
+        "totalInGameMinutes": 0.0,
+        "realSecondsPerInGameMinute": 6.0,
+        "isPaused": false
+    },
+    "isGameOver": false,
+    "craftCounter": 0
+}

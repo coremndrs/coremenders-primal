@@ -1,0 +1,53 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 16aab93755b33344b80f4f168c4df11e, type: 3}
+  m_Name: Def_Stone_Axe
+  m_EditorClassIdentifier: 
+  defId: 10
+  displayName: Stone Axe
+  prefab: {fileID: 6875332975740687603, guid: a89beda25745a904382714ac8195f7c5, type: 3}
+  aspects:
+  - rid: 365121865637167183
+  - rid: 365121865637167184
+  actions:
+  - action: {fileID: 11400000, guid: 21b4ed4eec758f445be3340143e6b0a4, type: 2}
+    labelOverride: 
+    timeRequired: 0
+    coop: 1
+    interruptsSkip: 0
+    yieldModel: 1
+    yields: []
+    payoutDestination: 0
+    onDepletion: 0
+    depletionSpawns: []
+    effects: []
+    allowedToolCategoryIds: 
+    toolRequired: 0
+    prerequisite: {fileID: 0}
+  references:
+    version: 2
+    RefIds:
+    - rid: 365121865637167183
+      type: {class: InventoryAspect, ns: Game.Simulation, asm: Game.Simulation}
+      data:
+        category: 3
+        weight: 1.5
+        stackable: 0
+        maxStack: 1
+        itemTypeTag: 4
+    - rid: 365121865637167184
+      type: {class: ToolAspect, ns: Game.Simulation, asm: Game.Simulation}
+      data:
+        toolCategoryId: 1
+        isDurabilityTool: 1
+        maxDurability: 100
+        brokenFormDefId: 1010

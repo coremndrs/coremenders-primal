@@ -1,0 +1,36 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9c084bde5d93507459b22ae45a98f774, type: 3}
+  m_Name: Recipe_StoneAxe
+  m_EditorClassIdentifier: 
+  recipeId: 4
+  displayName: Stone Axe
+  inputs:
+  - itemDefId: 11
+    amount: 2
+  - itemDefId: 1
+    amount: 2
+  requiredToolCategoryId: 0
+  requiredStationDefId: 1009
+  timeCost: 0
+  energyCost: 0
+  requiredLabor: 30
+  energyPerMinute: 2
+  coop: 1
+  unlockConditionId: 0
+  outputAmount: 1
+  tierTable:
+  - outputDefId: 10
+    weight: 80
+  - outputDefId: 1010
+    weight: 20
+  rollGranularity: 0
