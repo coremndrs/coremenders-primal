@@ -2430,3 +2430,97 @@ Run the existing **0.2.9 Consolidated setup + regression** (TDD §5.7, Parts B�
 
    - [x] ✅ Both dreamers snap to their checkpoint positions (`SnapToPositionRpc`) with the camera
      following correctly and no lingering look or velocity artefacts; movement resumes normally.
+
+---
+
+## Setup — Git & Archives
+
+Infrastructure task, not a gameplay build. Phases 1–7 of `Docs/Setup-Git-Migration.md`
+were executed by Claude Code; everything below needs the Unity Editor GUI or
+machine-local configuration, so it falls to you.
+
+- [ ] **Push the initial commit.** The commit exists locally (`main`, 464 files,
+  "Initial commit — Unity 6 project, Cluster 2 in progress") but `git push` failed
+  authentication — Git Credential Manager holds no valid github.com credential and
+  cannot prompt from a non-interactive session.
+  - Open a normal terminal at the project root.
+  - `gh auth login` (the GitHub CLI 2.97 is installed) — choose GitHub.com, HTTPS,
+    authenticate in the browser. Or clear the stale github.com entry in Windows
+    Credential Manager and let GCM's browser prompt fire on the next push.
+  - `git push -u origin main`
+  - *Why:* the repo is initialised and verified but nothing is on GitHub yet.
+
+- [ ] **Confirm the push landed.** Open `https://github.com/coremndrs/coremenders-primal`.
+  - `Assets/`, `Packages/`, `ProjectSettings/`, `Docs/`, `.claude/skills/` and
+    `CLAUDE.md` are all present.
+  - `Library/`, `Logs/`, `UserSettings/`, `obj/`, `.vs/` and every `.csproj`/`.sln`
+    are absent.
+  - `.claude/settings.local.json` is absent (machine-local, deliberately ignored).
+  - *Why:* the only cheap moment to catch a mis-scoped ignore rule is before history
+    accumulates on top of it.
+
+- [ ] **Verify Asset Serialization.** Unity → Edit → Project Settings → Editor.
+  - *Asset Serialization Mode* must be **Force Text**.
+  - *Version Control Mode* must be **Visible Meta Files**.
+  - *Why:* binary serialization turns every scene and prefab into an unmergeable
+    blob. `EditorSettings.asset` currently reads `m_SerializationMode: 2` (Force
+    Text) and metas are visible on disk, so this is a confirmation, not a change —
+    but confirm it in the GUI rather than assume.
+
+- [ ] **Reopen the project and check the Console is clean.**
+  - `Assets/Documentation/`, `Assets/CLAUDE.md` and `Assets/code-review-skill/` were
+    removed in Phase 1, along with their `.meta` files.
+  - Expect **no** "missing script", "meta file exists but its asset can't be found",
+    or broken-reference warnings.
+  - Six previously-empty folders (`Game/Art/Models`, `Game/Art/Textures`,
+    `Game/Audio`, `Game/Data/Buffs`, `Plugins`, `StreamingAssets/Templates/NewGame`)
+    now hold a `.gitkeep`. Unity ignores dot-files, so none should appear in the
+    Project window and no new `.meta` should be generated — confirm that.
+  - *Why:* a stale meta or a regenerated GUID would show up here first, and it is
+    much cheaper to fix before the folder GUIDs are baked into history.
+
+- [ ] **Configure UnityYAMLMerge** so the `merge=unityyamlmerge` attributes in
+  `.gitattributes` actually resolve to a driver. Run at the project root — the
+  installed editor is **6000.0.47f1**, so the path below is already correct:
+  ```
+  git config merge.unityyamlmerge.name "Unity SmartMerge"
+  git config merge.unityyamlmerge.driver "'C:/Program Files/Unity/Hub/Editor/6000.0.47f1/Editor/Data/Tools/UnityYAMLMerge.exe' merge -p %O %B %A %A"
+  git config merge.unityyamlmerge.recursive binary
+  ```
+  - Verify: `git config --get merge.unityyamlmerge.driver` echoes the path, and the
+    `.exe` exists at it.
+  - *Why:* without the driver, a scene or prefab conflict falls back to a plain text
+    merge and will corrupt the YAML. This is local config — it is not versioned, so
+    every machine that clones the repo must repeat it.
+
+- [ ] **Install restic and initialise the primary archive repo** per
+  `Docs/VersionControl.md`.
+  - Store the restic password in a password manager — **not** in the project folder,
+    and not only inside the backup it protects.
+  - *Why:* heavy binaries are gitignored by design, so a `git clone` alone does not
+    yield a runnable project. The archive is the other half of the recovery story.
+
+- [ ] **Initialise the second, off-site archive destination.** One local, one remote.
+  - *Why:* a single archive on the same machine as the project is not a backup.
+
+- [ ] **Run the first full restore test.** Restore to a scratch folder, open it in
+  Unity, and work through the four-point verification checklist in
+  `Docs/VersionControl.md`.
+  - *Why:* an untested restore is an assumption. Do it now, while the project is
+    small and a failed restore costs minutes.
+
+- [ ] **Delete the Phase 0 manual copy** at `f:\Latest\Coremenders - Primal Frost - Copy`
+  once the push has landed, the Console is clean and the restore test has passed.
+  - *Why:* it is a pre-git snapshot with no history; leaving it around invites
+    editing the wrong copy.
+
+### Notes on what was already done for you
+
+- `.git/hooks/pre-commit` is installed and executable — it blocks any commit
+  containing a file over 10 MB. Bypass deliberately with `git commit --no-verify`.
+  The hook is local-only and not versioned, so it must be recreated on any other
+  machine that clones the repo (script is in `Docs/Setup-Git-Migration.md`).
+- **Git LFS is not used and must not be introduced.** Verify with
+  `git ls-files -z | xargs -0 git check-attr filter | grep "filter: lfs"` — empty
+  output is correct. Do **not** verify with `git lfs ls-files`: any `git lfs`
+  command writes an `[lfs]` marker into `.git/config`.
