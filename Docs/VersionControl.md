@@ -102,11 +102,20 @@ Set `RESTIC_PASSWORD` (or `RESTIC_PASSWORD_FILE`) in the environment. **Store th
 ### Taking a snapshot
 
 ```
-restic -r G:\CoremendersBackup backup "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost" ^
-  --exclude Library --exclude Temp --exclude Obj ^
-  --exclude Logs --exclude Build --exclude UserSettings ^
+restic backup "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost" ^
+  --exclude-file "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost\Docs\restic-excludes.txt" ^
   --tag build-0.2.3
 ```
+
+`RESTIC_REPOSITORY` and `RESTIC_PASSWORD_FILE` are set as persistent **User** environment
+variables on this machine, so `-r` and a password prompt are both unnecessary.
+
+**The exclude list lives in `Docs/restic-excludes.txt`, not in inline flags** — inline flags are
+where mistakes hide. The first snapshot (`68561dd6`) passed `--exclude Obj` and archived 14.8 MiB
+of the lowercase `obj` MSBuild folder regardless, because restic's patterns are case-sensitive;
+it also never excluded `.vs`, which was another 172.7 MiB of Visual Studio cache. 70% of that
+snapshot was regenerable junk. A tracked exclude file is reviewable, travels with the repo, and
+can be fixed once for every machine.
 
 **Include `.git/` in the archive.** Excluding `Library/` is what keeps snapshots small; including `.git/` is what makes each snapshot a complete, self-contained project that opens without a separate clone step.
 

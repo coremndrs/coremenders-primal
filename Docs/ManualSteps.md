@@ -2889,17 +2889,21 @@ machine-local configuration, so it falls to you.
     125 Island01 terrain tiles (~68 MB) currently exist only in the working folder** —
     not in git, not in any archive.
 
-- [x] **First snapshot — `68561dd6`, tag `terrain-island01`, 2026-09-13.**
-  266.8 MiB processed, 50.7 MiB stored after dedup; 1602 files. Verified to contain all
-  **124 Island01 terrain tiles**, the gitignored `Assets/Imports/` model, and `.git/`;
-  `Library/` excluded.
+- [x] **First good snapshot — `875522d0`, tag `terrain-island01`, 2026-09-13.**
+  70.1 MiB restore size (66.5 MiB of that is the terrain), ~50 MiB on disk for the whole
+  repo after zstd compression — restic reports a 5.04× ratio, which is what heightmap data
+  does. Verified to contain all **124 Island01 terrain tiles**, the gitignored
+  `Assets/Imports/` model and `.git/`, with no `.vs`, `obj` or `Library`.
   ```powershell
   restic backup "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost" `
-    --exclude Library --exclude Temp --exclude Obj `
-    --exclude Logs --exclude Build --exclude UserSettings `
+    --exclude-file "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost\Docs\restic-excludes.txt" `
     --tag terrain-island01
   restic snapshots
   ```
+  - **Superseded: `68561dd6`** (266.8 MiB) — the first attempt used inline `--exclude` flags
+    and swept in 172.7 MiB of `.vs` and 14.8 MiB of lowercase `obj`; restic's patterns are
+    case-sensitive on Windows and `.vs` was never listed. The exclude list now lives in
+    `Docs/restic-excludes.txt`. Forget + prune that snapshot to reclaim the space.
   - *Why:* `.git/` is deliberately **included** — that is what makes a snapshot a
     self-contained project rather than half of one. This snapshot is the only copy of
     the terrain tiles and the imported model that exists outside the working folder.

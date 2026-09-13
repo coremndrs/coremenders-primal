@@ -1,0 +1,33 @@
+# restic exclude list for the Coremenders project archive.
+#   restic backup "<project root>" --exclude-file Docs/restic-excludes.txt --tag <tag>
+#
+# Patterns match any path component at any depth and are CASE-SENSITIVE on Windows,
+# which is why both Obj and obj appear below — Unity writes "Obj", MSBuild writes "obj",
+# and the first archive snapshot (68561dd6) carried 14.8 MiB of the latter because only
+# the capitalised form was excluded.
+#
+# .git/ is deliberately NOT excluded. Including it is what makes a snapshot a complete,
+# self-contained project that opens without a separate clone.
+
+# ── Unity — regenerable ──────────────────────────────────────────
+Library
+Temp
+Obj
+obj
+Logs
+Build
+Builds
+UserSettings
+MemoryCaptures
+Recordings
+
+# ── IDE / tooling caches ─────────────────────────────────────────
+# .vs alone was 172.7 MiB at the first snapshot — Visual Studio's solution cache,
+# rebuilt on demand and worth nothing in an archive.
+.vs
+.vscode
+.idea
+*.csproj
+*.sln
+*.user
+*.suo
