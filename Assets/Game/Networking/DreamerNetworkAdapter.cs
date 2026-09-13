@@ -47,6 +47,18 @@ namespace Game.Networking
         public int Slot => _slotVar.Value;
         public AppearanceDataDto AppearanceDto => _appearance.Value;
 
+        /// <summary>
+        /// The slot this peer's local player controls, or -1 before their dreamer spawns.
+        ///
+        /// Ownership lives in the host's RuntimeDataManager (`GetOwner`), which a client does not
+        /// have — every lookup there returns "no owner" on a client. UI that needs to know
+        /// "is this me?" must ask this instead, or it silently renders the other player's view.
+        /// </summary>
+        public static int LocalSlot { get; private set; } = -1;
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetStatics() => LocalSlot = -1;
+
         /// <summary>Called by DreamerSpawner immediately after Instantiate, before SpawnWithOwnership.</summary>
         public void Initialize(int slot) => _localSlot = slot;
 
@@ -65,6 +77,8 @@ namespace Game.Networking
                     _appearance.Value = AppearanceDataDto.From(record.appearance);
             }
 
+            if (IsOwner) LocalSlot = Slot;
+
             // Register this transform so the save system can sample live position on demand (TDD §1.5).
             RuntimeDataManager.Instance.RegisterDreamerTransform(Slot, transform);
 
@@ -80,6 +94,7 @@ namespace Game.Networking
 
         public override void OnNetworkDespawn()
         {
+            if (IsOwner && LocalSlot == Slot) LocalSlot = -1;
             RuntimeDataManager.Instance?.UnregisterDreamerTransform(Slot);
             _appearance.OnValueChanged -= OnAppearanceChanged;
             base.OnNetworkDespawn();

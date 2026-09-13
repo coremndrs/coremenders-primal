@@ -1,4 +1,5 @@
 using System;
+using Game.Simulation;
 using UnityEngine;
 
 namespace Game.Networking
@@ -80,6 +81,12 @@ namespace Game.Networking
         public float requiredLabor;
         [Tooltip("Energy per committed labor-minute for a station craft (seam; reserved via the §5.5 engine).")]
         public float energyPerMinute;
+
+        [Header("Class (§5.5.1, 0.2.11a1)")]
+        [Tooltip("Presence + clock semantics for this craft. Crafting is Active per the 0.2.11a2 " +
+                 "reclassification — you stand at the work for its duration. Authored here because a " +
+                 "recipe is its own def, not an ActionDef verb.")]
+        public ActionClass actionClass = ActionClass.Active;
 
         [Header("Co-op / unlock")]
         [Tooltip("§5.6.4: true = combined-labor accrual (two dreamers assist); false = single-crafter lock.")]

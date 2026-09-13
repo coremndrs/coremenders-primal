@@ -47,20 +47,34 @@ namespace Game.Networking
         [SerializeField] private KeyCode _precisionKey    = KeyCode.LeftControl;
 
         [Header("Action menu")]
-        [Tooltip("Opens/closes the targeted object's action menu. Opening frees the cursor and " +
-                 "suspends mouselook; the target is frozen while the menu is open.")]
+        [Tooltip("Tap opens/closes the targeted object's action menu; HOLD commits the maximum on " +
+                 "the primary timed action (0.2.11c2). Opening frees the cursor and suspends " +
+                 "mouselook; the target is frozen while the menu is open.")]
         [SerializeField] private KeyCode _actionMenuKey = KeyCode.E;
+
+        [Tooltip("Seconds the interact key must be held before it counts as hold-for-max rather " +
+                 "than a tap (0.2.11c2). The hold lives on this key, NOT on the precision key " +
+                 "(Left Ctrl), so the two gestures cannot collide.")]
+        [SerializeField] private float _holdToCommitSeconds = 0.35f;
+
+        [Tooltip("Commit durations offered by the tap menu, in IG minutes (0.2.11c1). Any option " +
+                 "above the cap — the lesser of remaining labor and the dreamer's day pool — is " +
+                 "hidden rather than shown disabled, so every visible option is committable.")]
+        [SerializeField] private float[] _commitOptionsMinutes = { 15f, 30f, 60f, 120f };
 
         [Header("Debug")]
         [Tooltip("Draw a small owner-only readout of what the interaction probe is resolving each " +
                  "frame (camera status / hit count / target). Turn off once interaction is confirmed.")]
         [SerializeField] private bool _showProbeDebug = true;
 
-        private DreamerTaskSync _taskSync;
-        private Interactable    _target;
-        private Interactable    _menuTarget;      // the object the action menu was opened on
-        private bool            _menuOpen;        // authoritative — survives _menuTarget being destroyed
-        private string          _probeDebug = "(idle)";
+        private DreamerTaskSync      _taskSync;
+        private DreamerInventorySync _inventorySync;   // owner's synced day pool, for the commit cap
+        private Interactable         _target;
+        private Interactable         _menuTarget;   // the object the action menu was opened on
+        private bool                 _menuOpen;     // authoritative — survives _menuTarget being destroyed
+        private string               _probeDebug = "(idle)";
+        private float                _holdTimer = -1f;         // <0 = not tracking a press (0.2.11c2)
+        private int                  _durationMenuAction = -1; // action index whose duration list is expanded
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
         private static void ResetStatics() { /* no statics; hook satisfies the project pattern */ }
@@ -68,7 +82,8 @@ namespace Game.Networking
         public override void OnNetworkSpawn()
         {
             base.OnNetworkSpawn();
-            _taskSync = GetComponent<DreamerTaskSync>();
+            _taskSync      = GetComponent<DreamerTaskSync>();
+            _inventorySync = GetComponent<DreamerInventorySync>();
         }
 
         public override void OnNetworkDespawn()
@@ -120,8 +135,69 @@ namespace Game.Networking
             _target     = ProbeForInteractable(cam, radius, out string dbg);
             _probeDebug = precision ? $"[precision] {dbg}" : dbg;
 
-            if (_target != null && Input.GetKeyDown(_actionMenuKey))
-                OpenActionMenu(_target);
+            HandleInteractGesture();
+        }
+
+        // ── Tap-menu / hold-max gesture (§5.5.3, 0.2.11c1/c2) ────────────────────
+        //
+        // One key, two gestures, resolved on release:
+        //   tap  → open the duration menu, so a partial commit is a deliberate choice
+        //   hold → commit the maximum straight away, no menu
+        //
+        // Max-on-hold is what defuses the "the largest commitment is always optimal, so the picker
+        // is a false choice" objection (§5.5.15 #2): the optimal play is the ONE-gesture default,
+        // and the menu becomes the deliberate override for a short commit rather than a trap the
+        // player has to reason past every time.
+        //
+        // The hold sits on the interact key, not the precision key (Left Ctrl, FP Group E e3), so
+        // holding to aim precisely and holding to commit can never be the same input.
+
+        private void HandleInteractGesture()
+        {
+            if (_target == null)
+            {
+                _holdTimer = -1f;
+                return;
+            }
+
+            if (Input.GetKeyDown(_actionMenuKey)) _holdTimer = 0f;
+
+            if (_holdTimer >= 0f && Input.GetKey(_actionMenuKey))
+            {
+                _holdTimer += Time.deltaTime;
+                if (_holdTimer >= _holdToCommitSeconds)
+                {
+                    CommitMaxOnPrimaryAction(_target);
+                    _holdTimer = -1f;           // consumed; the release below must not also open the menu
+                }
+                return;
+            }
+
+            if (Input.GetKeyUp(_actionMenuKey) && _holdTimer >= 0f)
+            {
+                OpenActionMenu(_target);        // released before the hold threshold → a tap
+                _holdTimer = -1f;
+            }
+        }
+
+        /// <summary>
+        /// Hold-for-max (c2): commits the largest valid duration on the object's first timed,
+        /// incomplete action. -1 tells the host "the maximum", which it computes as
+        /// min(remaining labor, day pool) — the client never decides the cap.
+        /// </summary>
+        private void CommitMaxOnPrimaryAction(Interactable target)
+        {
+            if (target?.def == null) return;
+            foreach (var (idx, action) in target.WorldActions())
+            {
+                if (action.timeRequired <= 0f) continue;
+                if (MapEntitySync.Instance != null &&
+                    MapEntitySync.Instance.TryGetProcessableActionState(target.instanceId, idx, out _, out bool done) && done)
+                    continue;
+
+                _taskSync?.DispatchWorldActionServerRpc(target.instanceId, idx, -1f);
+                return;
+            }
         }
 
         /// <summary>
@@ -177,6 +253,7 @@ namespace Game.Networking
         private void CloseActionMenu()
         {
             if (!_menuOpen) return;
+            _durationMenuAction = -1;
             _menuTarget = null;
             _menuOpen   = false;
             UiFocus.Release(this);
@@ -236,7 +313,14 @@ namespace Game.Networking
 
                 float bw = action.timeRequired > 0f ? 100f : 160f;
                 if (GUI.Button(new Rect(x, y, bw, 22f), label))
-                    _taskSync?.DispatchWorldActionServerRpc(_target.instanceId, idx);
+                {
+                    // Timed action → expand its duration list (c1); instant action → just do it,
+                    // there is no commitment to size.
+                    if (action.timeRequired > 0f)
+                        _durationMenuAction = _durationMenuAction == idx ? -1 : idx;
+                    else
+                        _taskSync?.DispatchWorldActionServerRpc(_target.instanceId, idx);
+                }
 
                 if (!done && action.timeRequired > 0f)
                     if (GUI.Button(new Rect(x + 104f, y, 56f, 22f), "Stop"))
@@ -244,7 +328,59 @@ namespace Game.Networking
 
                 GUI.enabled = true;
                 y += 26f;
+
+                if (!done && _durationMenuAction == idx)
+                    y = DrawDurationOptions(idx, x + 12f, y);
             }
+        }
+
+        /// <summary>
+        /// The commit-duration list for one action (c1). Every option shown is committable: anything
+        /// above the cap is omitted entirely rather than greyed out, because an option you can see
+        /// but never pick is a worse answer than one that was never offered.
+        ///
+        /// The cap is computed from replicated state only — the accrual snapshot in the world-object
+        /// payload plus this dreamer's own synced day pool — because this runs on whichever peer owns
+        /// the dreamer, and the host's RuntimeDataManager does not exist on a client. The host caps
+        /// again on receipt; this copy decides which buttons to draw and nothing more.
+        /// </summary>
+        private float DrawDurationOptions(int actionIndex, float x, float y)
+        {
+            var mapSync = MapEntitySync.Instance;
+            if (mapSync == null) return y;
+
+            if (_inventorySync == null) _inventorySync = GetComponent<DreamerInventorySync>();
+            float pool = _inventorySync != null ? _inventorySync.TimePool : 0f;
+            float cap  = mapSync.EstimateMaxCommit(_target.def, _target.instanceId, actionIndex, pool);
+            if (cap <= 0f)
+            {
+                GUI.Label(new Rect(x, y, 220f, 20f), "no time to commit");
+                return y + 22f;
+            }
+
+            GUI.Label(new Rect(x, y, 220f, 20f), $"commit for…  (max {cap:F0}m)");
+            y += 22f;
+
+            float bx = x;
+            foreach (float opt in _commitOptionsMinutes)
+            {
+                if (opt <= 0f || opt > cap) continue;      // over-cap options are never shown
+                if (GUI.Button(new Rect(bx, y, 46f, 20f), $"{opt:F0}m"))
+                {
+                    _taskSync?.DispatchWorldActionServerRpc(_target.instanceId, actionIndex, opt);
+                    _durationMenuAction = -1;
+                }
+                bx += 50f;
+            }
+
+            // "All" is the cap itself — the same thing hold-interact commits, offered here too so
+            // the menu is never a downgrade from the gesture.
+            if (GUI.Button(new Rect(bx, y, 62f, 20f), $"all {cap:F0}m"))
+            {
+                _taskSync?.DispatchWorldActionServerRpc(_target.instanceId, actionIndex, -1f);
+                _durationMenuAction = -1;
+            }
+            return y + 24f;
         }
 
         /// <summary>The Interactable currently targeted by the owning dreamer's center-screen cast

@@ -46,6 +46,23 @@ namespace Game.Simulation
         public bool          allowsOverdraft;
         public ActionPayout  payoutShape;
         public bool          interruptsSkip;
+
+        // ── Class (§5.5.1, 0.2.11a1) ─────────────────────────────────────────────
+        // Consuming is not verb-backed (it has no ActionDef), so the class is authored here.
+        //
+        // IGNORED for Food and Drink: eating and drinking are Trivial by nature and always execute
+        // instantly, so Def.consumeActionClass derives their class from consumeEffect rather than
+        // reading this field. Trusting the field there would let one un-reclassified Def turn a meal
+        // into a clock-advancing action that occupies the dreamer's single slot — a bug invisible
+        // until playtest. This field governs the other consumable kinds (SaveConsumable, and
+        // whatever comes next).
+
+        public ActionClass   actionClass = ActionClass.Active;
+
+        /// <summary>§5.5.5: may be consumed on an empty trivial bracket. Author true only on the
+        /// survival list — the same items that carry <see cref="allowsOverdraft"/>. Inert until
+        /// 0.2.11d5.</summary>
+        public bool          allowsCriticalBypass;
     }
 
     /// <summary>

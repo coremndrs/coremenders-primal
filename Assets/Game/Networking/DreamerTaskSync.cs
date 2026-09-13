@@ -72,26 +72,88 @@ namespace Game.Networking
         private void PushFromRdm()
         {
             if (_adapter == null) return;
-            var task = RuntimeDataManager.Instance?.GetDreamer(_adapter.Slot)?.task;
-            if (task == null) return;
+            var dreamer = RuntimeDataManager.Instance?.GetDreamer(_adapter.Slot);
+            if (dreamer == null) return;
 
-            _taskType.Value = (int)task.type;
-            _elapsed.Value  = task.elapsedMinutes;
-            _duration.Value = task.durationMinutes;
+            // 0.2.11a3: the slot is the head of the action queue, not the retired DreamerTask.
+            // Elapsed is derived from the clock rather than accumulated, so it stays exact across
+            // a skip (which advances the clock in chunks) and a revert (which rewinds it).
+            var   active = dreamer.ActiveAction();
+            float now    = RuntimeDataManager.Instance?.WorldState?.clock?.totalInGameMinutes ?? 0f;
+
+            _taskType.Value = (int)dreamer.CurrentTaskType();
+            _elapsed.Value  = active?.ElapsedAt(now) ?? 0f;
+            // Externally-resolved work (object-bound labor, crafts) has no duration to run against —
+            // its progress bar is the accrual readout, so report 0 and let the HUD skip the bar.
+            _duration.Value = active != null && !active.externallyResolved ? active.duration : 0f;
         }
 
         // ── Task assignment RPC ───────────────────────────────────────────────────
 
-        /// <summary>Owner sends desired task type; server creates and writes it to the RDM.</summary>
+        /// <summary>
+        /// Owner sends desired needs task; server mints the slot entry and writes it to the RDM.
+        ///
+        /// 0.2.11a3: sleep and rest now occupy the SAME slot as consumables and world labor, so a
+        /// request is rejected while the dreamer is already committed — one active action at a time.
+        /// <see cref="TaskType.Idle"/> is the cancel: it vacates the slot.
+        /// </summary>
         [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
         public void RequestTaskServerRpc(int taskTypeInt)
         {
-            var type   = (TaskType)taskTypeInt;
-            var record = RuntimeDataManager.Instance?.GetDreamer(_adapter.Slot);
+            var type    = (TaskType)taskTypeInt;
+            var record  = RuntimeDataManager.Instance?.GetDreamer(_adapter.Slot);
             if (record == null) return;
 
-            record.task = GetNeedsConfig().CreateTask(type);
-            Debug.Log($"[DreamerTaskSync] Slot {_adapter.Slot} → task {type} ({record.task.durationMinutes} min)");
+            if (type == TaskType.Idle)
+            {
+                CancelActiveTask(record);
+                return;
+            }
+
+            var entry = GetNeedsConfig().CreateTaskAction(type);
+            if (entry == null)
+            {
+                Debug.LogWarning($"[DreamerTaskSync] Slot {_adapter.Slot}: {type} is not a needs task.");
+                return;
+            }
+
+            if (record.IsBusy())
+            {
+                Debug.LogWarning($"[DreamerTaskSync] Slot {_adapter.Slot}: {type} rejected — already " +
+                                 $"committed to {record.CurrentTaskType()} (§5.5 single active slot).");
+                return;
+            }
+
+            // Presence anchor (§5.5.3, 0.2.11b3): rest and sleep bind the body to the spot they were
+            // started at. Walking off cancels them, same as a hand craft.
+            var pos = RuntimeDataManager.Instance?.GetDreamerPosition(_adapter.Slot) ?? Vector3.zero;
+            entry.presenceAnchored = true;
+            entry.presenceAnchor   = new Float3(pos.x, pos.y, pos.z);
+
+            record.actionQueue ??= new System.Collections.Generic.List<ActionRecord>();
+            record.actionQueue.Add(entry);
+            ForcePush();
+            Debug.Log($"[DreamerTaskSync] Slot {_adapter.Slot} → task {type} ({entry.duration} min)");
+        }
+
+        /// <summary>
+        /// Vacates the slot when it holds a needs task. Object-bound labor and crafts are NOT
+        /// cancelled here — those have their own stop paths that refund and close accrual segments,
+        /// and dropping the record without them would strand the contributor on the object.
+        /// </summary>
+        private void CancelActiveTask(Game.Simulation.DreamerRecord record)
+        {
+            var active = record.ActiveAction();
+            if (active == null) return;
+            if (active.kind != ActionSlotKind.Task)
+            {
+                Debug.LogWarning($"[DreamerTaskSync] Slot {_adapter.Slot}: Idle ignored — the slot holds " +
+                                 $"{active.kind}; stop it through its own action instead.");
+                return;
+            }
+            record.RemoveAt(0);
+            ForcePush();
+            Debug.Log($"[DreamerTaskSync] Slot {_adapter.Slot} → Idle (task cancelled).");
         }
 
         /// <summary>Called by SkipManager after a skip completes to push final state immediately.</summary>
@@ -211,11 +273,15 @@ namespace Game.Networking
         /// <summary>
         /// Owner selects a world action on an Interactable; server routes to instant or timed
         /// dispatch based on ActionDef.timeRequired (TDD §1.12, 0.2.9c3).
+        ///
+        /// <paramref name="committedMinutes"/> (0.2.11c1/c2) is how long they are committing for:
+        /// a duration picked from the tap menu, or -1 for "the maximum" — the hold-interact gesture.
+        /// The host caps it either way, so a client cannot over-commit by sending a large number.
         /// </summary>
         [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
-        public void DispatchWorldActionServerRpc(int instanceId, int actionIndex)
+        public void DispatchWorldActionServerRpc(int instanceId, int actionIndex, float committedMinutes = -1f)
         {
-            MapEntitySync.Instance?.DispatchWorldAction(instanceId, actionIndex, _adapter.Slot);
+            MapEntitySync.Instance?.DispatchWorldAction(instanceId, actionIndex, _adapter.Slot, committedMinutes);
         }
 
         /// <summary>Owner stops contributing to a timed world action (companion to DispatchWorldActionServerRpc).</summary>

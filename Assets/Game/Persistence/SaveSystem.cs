@@ -30,7 +30,7 @@ namespace Game.Persistence
     /// </summary>
     public static class SaveSystem
     {
-        public const int    CurrentSchemaVersion = 19; // bumped at 0.2.9f: authored nodes — Instance.authored/depleted (delta records materialised into map_{id}.json worldObjects, keyed by baked id)
+        public const int    CurrentSchemaVersion = 20; // bumped at 0.2.11: channel collapse (DreamerTask retired — sleep/rest/gather/craft occupy the single actionQueue slot) + commitment/presence/bracket fields (ActionRecord gains actionClass/kind/taskType/instanceId/actionIndex/recipeId/externallyResolved/committedMinutes/commitStart/presenceAnchor; DreamerRecord gains trivialBracket)
         public const string DefaultSlot          = "slot_0";
         public const string CheckpointSlot       = "checkpoint"; // legacy single-slot (kept for reference; use named checkpoints)
 
@@ -77,18 +77,89 @@ namespace Game.Persistence
         {
             var world = ReadFile<WorldState>(dirPath, "world.json");
 
-            if (world.schemaVersion != CurrentSchemaVersion)
+            if (world.schemaVersion != CurrentSchemaVersion &&
+                world.schemaVersion != TwoChannelSchemaVersion)
                 throw new InvalidOperationException(
                     $"[SaveSystem] Schema mismatch — expected v{CurrentSchemaVersion}, got v{world.schemaVersion}. File: {dirPath}");
+
+            bool legacyTwoChannel = world.schemaVersion == TwoChannelSchemaVersion;
 
             world.dreamers    = new DreamerRecord[2];
             world.dreamers[0] = ReadFile<DreamerRecord>(dirPath, "dreamer_0.json");
             world.dreamers[1] = ReadFile<DreamerRecord>(dirPath, "dreamer_1.json");
 
+            if (legacyTwoChannel)
+            {
+                for (int i = 0; i < world.dreamers.Length; i++)
+                    PromoteTwoChannelDreamer(world.dreamers[i],
+                        ReadFile<LegacyTwoChannelDreamer>(dirPath, $"dreamer_{i}.json"),
+                        world.clock?.totalInGameMinutes ?? 0f);
+                world.schemaVersion = CurrentSchemaVersion;
+            }
+
             var mapLayer = ReadFile<MapEntityLayer>(dirPath, $"map_{world.mapId}.json");
 
-            Debug.Log($"[SaveSystem] Loaded from {dirPath}");
+            Debug.Log($"[SaveSystem] Loaded from {dirPath}" +
+                      (legacyTwoChannel ? $" (migrated v{TwoChannelSchemaVersion} → v{CurrentSchemaVersion})" : ""));
             return (world, mapLayer);
+        }
+
+        // ── v19 → v20: the 0.2.11a3 channel collapse (a5) ────────────────────────
+        //
+        // A one-off, deliberately narrow upgrade — not the start of a migration framework. Old
+        // saves are normally rejected loudly during development (CLAUDE.md); this exception exists
+        // because 0.2.11a retires a whole channel and dev-stage saves predating it are common.
+        // DELETE both this block and TwoChannelSchemaVersion at the next schema bump.
+
+        /// <summary>The last schema that carried two independent action channels (DreamerTask +
+        /// actionQueue). Readable, then promoted in place.</summary>
+        private const int TwoChannelSchemaVersion = 19;
+
+        /// <summary>The fields of a v19 dreamer record that v20 no longer has. Read as a second,
+        /// tolerant pass over the same file; everything else comes from the real DreamerRecord.</summary>
+        private class LegacyTwoChannelDreamer
+        {
+            public LegacyTask task;
+
+            public class LegacyTask
+            {
+                public TaskType type;
+                public float    durationMinutes;
+                public float    elapsedMinutes;
+            }
+        }
+
+        /// <summary>
+        /// Promotes a v19 dreamer to the single-slot model: the Task-channel record becomes the
+        /// active slot entry and any Action-channel (consumable) records are discarded, per 0.2.11a5.
+        ///
+        /// Only sleep and rest are promoted with their remaining duration intact. A v19 Gathering or
+        /// Crafting task was a marker for work whose real state lives on the Instance / CraftRecord,
+        /// and re-opening those needs the accrual segment and the join clock that the marker never
+        /// held — so they are dropped, leaving the dreamer idle next to resumable world progress.
+        /// </summary>
+        private static void PromoteTwoChannelDreamer(DreamerRecord dreamer, LegacyTwoChannelDreamer legacy, float nowMinutes)
+        {
+            if (dreamer == null) return;
+            dreamer.actionQueue?.Clear();
+
+            var task = legacy?.task;
+            if (task == null || (task.type != TaskType.Sleeping && task.type != TaskType.Resting)) return;
+
+            float remaining = Math.Max(0f, task.durationMinutes - task.elapsedMinutes);
+            if (remaining <= 0f) return;
+
+            dreamer.actionQueue ??= new List<ActionRecord>();
+            dreamer.actionQueue.Add(new ActionRecord
+            {
+                kind      = ActionSlotKind.Task,
+                taskType  = task.type,
+                duration  = remaining,
+                started   = true,
+                startTime = nowMinutes,
+            });
+            Debug.Log($"[SaveSystem] Migrated slot {dreamer.slot}: {task.type} promoted to the single " +
+                      $"action slot with {remaining:F0} min remaining.");
         }
 
         public static (WorldState, MapEntityLayer) LoadSlot(string slot = DefaultSlot) =>

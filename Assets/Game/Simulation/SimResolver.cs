@@ -26,6 +26,8 @@ namespace Game.Simulation
     ///           Step gains actionsEnded + distanceMoved + movementConfig optional params
     ///   0.2.9 — action economy is up-front (debit on start) + pro-rata refund on stop, applied by
     ///           MapEntitySync (ApplyActionEffect helper here); no per-minute work stage in Step
+    ///   0.2.11 — channel collapse: stages 4a and 4b merge into one stage 4 over the single action
+    ///           slot (DreamerTask is retired); sleep/rest payouts move into FireActionCompletion
     /// </summary>
     public static class SimResolver
     {
@@ -76,7 +78,7 @@ namespace Game.Simulation
             foreach (var dreamer in world.dreamers)
             {
                 if (dreamer?.needs == null) continue;
-                float actMod = config.GetActivityMultiplier(dreamer.task?.type ?? TaskType.Idle);
+                float actMod = config.GetActivityMultiplier(dreamer.CurrentTaskType());
                 float hMod   = GetBuffMod(dreamer, BuffStat.HungerDrainMultiplier, buffConfig);
                 float tMod   = GetBuffMod(dreamer, BuffStat.ThirstDrainMultiplier, buffConfig);
                 float wMod   = GetBuffMod(dreamer, BuffStat.WarmthDrainMultiplier, buffConfig);
@@ -90,13 +92,22 @@ namespace Game.Simulation
                 if (tRate > 0f) dreamer.needs.thirst = (float)Math.Min(100.0, dreamer.needs.thirst + tRate);
             }
 
-            // Stage 4a: advance action queue; fire completions; auto-advance (0.2.3b2/b3).
-            // Ordering: drain (3) → action outputs (4a) → task outputs (4b) → affliction check (5).
+            // Stage 4: advance the single action slot; fire completions; auto-advance (0.2.3b2/b3).
+            // Ordering: drain (3) → slot outputs (4) → affliction check (5). A meal completing this
+            // tick refills hunger before the affliction check.
+            //
+            // 0.2.11a3: this used to be two loops — 4a over the action queue and 4b over the
+            // now-retired DreamerTask channel. They are one loop because there is one slot. Needs
+            // tasks (sleep / rest) arrive here as ActionRecords with kind = Task and are timed out
+            // by the same duration test as a consumable; only their completion payout differs.
+            //
+            // Entries flagged externallyResolved (object-bound labor, crafts) are STARTED here but
+            // never completed here: their progress is labor accrual on an Instance, not elapsed
+            // duration, and their owning subsystem clears the slot.
             foreach (var dreamer in world.dreamers)
             {
-                if (dreamer?.actionQueue == null || dreamer.actionQueue.Count == 0) continue;
-
-                var active = dreamer.actionQueue[0];
+                var active = dreamer?.ActiveAction();
+                if (active == null) continue;
 
                 // Start the action when it first reaches the head of the queue
                 if (!active.started)
@@ -106,57 +117,22 @@ namespace Game.Simulation
                     InstallNourishmentBuffs(dreamer, active);
                 }
 
-                // Fire completion when end time reached
-                if (world.clock.totalInGameMinutes >= active.startTime + active.duration)
+                // Fire completion when end time reached (duration-driven entries only)
+                if (active.IsCompleteAt(world.clock.totalInGameMinutes))
                 {
-                    FireActionCompletion(dreamer, active, actionsEnded);
+                    FireActionCompletion(dreamer, active, config, buffConfig, sleepEnded, actionsEnded);
                     RemoveNourishmentBuffs(dreamer);
                     dreamer.actionQueue.RemoveAt(0);
 
                     // Auto-advance: start the next queued action in the same tick (0.2.3b2)
-                    if (dreamer.actionQueue.Count > 0)
+                    var next = dreamer.ActiveAction();
+                    if (next != null && !next.started)
                     {
-                        var next     = dreamer.actionQueue[0];
                         next.started   = true;
                         next.startTime = world.clock.totalInGameMinutes;
                         InstallNourishmentBuffs(dreamer, next);
                     }
                 }
-            }
-
-            // Stage 4b: advance tasks; apply outputs on completion.
-            // Critical ordering: drain (3) → outputs (4b) → affliction check (5).
-            // A meal completing this tick refills hunger before the affliction check.
-            foreach (var dreamer in world.dreamers)
-            {
-                if (dreamer?.task == null || dreamer.task.type == TaskType.Idle) continue;
-
-                dreamer.task.elapsedMinutes += 1f;
-                if (!dreamer.task.IsComplete) continue;
-
-                switch (dreamer.task.type)
-                {
-                    case TaskType.Sleeping:
-                    {
-                        float rMod = GetBuffMod(dreamer, BuffStat.EnergyRecoveryMultiplier, buffConfig);
-                        dreamer.energy = (float)Math.Min(100.0, dreamer.energy + config.sleepEnergyRestore * rMod);
-                        sleepEnded?.Add(new SleepEndedResult
-                        {
-                            DreamerSlot  = dreamer.slot,
-                            SleptMinutes = dreamer.task.elapsedMinutes, // includes this tick
-                            WasCutShort  = false,
-                        });
-                        break;
-                    }
-                    case TaskType.Resting:
-                    {
-                        float rMod = GetBuffMod(dreamer, BuffStat.EnergyRecoveryMultiplier, buffConfig);
-                        dreamer.energy = (float)Math.Min(100.0, dreamer.energy + config.restEnergyRestore * rMod);
-                        break;
-                    }
-                }
-
-                dreamer.task = new DreamerTask();
             }
 
             // (Action economy is applied up front on start and refunded pro-rata on stop by
@@ -276,9 +252,36 @@ namespace Game.Simulation
                 b.defId == ActionRecord.NourishmentThirstBuffId);
         }
 
+        /// <summary>
+        /// Applies whatever a completing slot entry pays out. Consumables report their end-effect
+        /// to the caller; needs tasks (folded in from the retired stage 4b at 0.2.11a3) restore
+        /// energy and report a completed sleep.
+        /// </summary>
         private static void FireActionCompletion(DreamerRecord dreamer, ActionRecord action,
-            IList<ActionEndedResult> actionsEnded)
+            NeedsConfig config, BuffConfig buffConfig,
+            IList<SleepEndedResult> sleepEnded, IList<ActionEndedResult> actionsEnded)
         {
+            if (action.kind == ActionSlotKind.Task)
+            {
+                float rMod = GetBuffMod(dreamer, BuffStat.EnergyRecoveryMultiplier, buffConfig);
+                switch (action.taskType)
+                {
+                    case TaskType.Sleeping:
+                        dreamer.energy = (float)Math.Min(100.0, dreamer.energy + config.sleepEnergyRestore * rMod);
+                        sleepEnded?.Add(new SleepEndedResult
+                        {
+                            DreamerSlot  = dreamer.slot,
+                            SleptMinutes = action.duration, // full window — this is the not-cut-short path
+                            WasCutShort  = false,
+                        });
+                        break;
+                    case TaskType.Resting:
+                        dreamer.energy = (float)Math.Min(100.0, dreamer.energy + config.restEnergyRestore * rMod);
+                        break;
+                }
+                return;
+            }
+
             if (action.payout == ActionPayout.EndEffect)
                 actionsEnded?.Add(new ActionEndedResult
                 {

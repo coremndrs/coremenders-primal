@@ -4,7 +4,6 @@
     "appearance": { "skinTone": 0, "hairStyle": 0, "hairColor": 0 },
     "needs": { "hunger": 100.0, "thirst": 100.0, "warmth": 100.0 },
     "energy": 80.0,
-    "task": { "type": 0, "durationMinutes": 0.0, "elapsedMinutes": 0.0 },
     "vitality": 100.0,
     "afflictions": { "isStarving": false, "isDehydrated": false, "isHypothermic": false },
     "isIncapacitated": false,
@@ -17,5 +16,6 @@
         "quiver": null
     },
     "timePool": 1440.0,
+    "trivialBracket": 60.0,
     "actionQueue": []
 }

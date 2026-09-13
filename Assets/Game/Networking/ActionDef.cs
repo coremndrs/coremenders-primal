@@ -49,6 +49,18 @@ namespace Game.Networking
 
         [Tooltip("Where this action is presented — world (in the scene) and/or inventory (in a container).")]
         public ActionContext context = ActionContext.World;
+
+        [Header("Class (§5.5.1, 0.2.11a1)")]
+        [Tooltip("Presence + clock semantics for this verb. Active = present for the full duration, " +
+                 "world clock advances by it. Trivial = momentary, world clock does not advance, the " +
+                 "duration is debited from the trivial bracket. Passive = runs on the object with " +
+                 "nobody present. Authored per verb — never derived from duration.")]
+        public ActionClass actionClass = ActionClass.Active;
+
+        [Tooltip("Trivial verbs only (§5.5.5): may execute on an empty trivial bracket. Author true " +
+                 "for the survival cases only — eat while starving, drink while dehydrated, bandage " +
+                 "while bleeding. INERT until 0.2.11d5 reads it.")]
+        public bool allowsCriticalBypass;
     }
 
     // ── ItemAction — the per-item binding ─────────────────────────────────────────
@@ -112,6 +124,12 @@ namespace Game.Networking
         public string        actionId => action != null ? action.actionId : "";
         public ActionOutcome outcome  => action != null ? action.outcome  : ActionOutcome.Transform;
         public ActionContext context  => action != null ? action.context  : ActionContext.World;
+
+        /// <summary>§5.5.1 class, from the verb. Active when the verb is missing — the conservative
+        /// default (see <see cref="ActionClass"/>).</summary>
+        public ActionClass   actionClass         => action != null ? action.actionClass         : ActionClass.Active;
+        /// <summary>§5.5.5 critical bypass, from the verb. Inert until 0.2.11d5.</summary>
+        public bool          allowsCriticalBypass => action != null && action.allowsCriticalBypass;
 
         /// <summary>UI label — the override if set, else the verb's actionId.</summary>
         public string DisplayLabel => !string.IsNullOrEmpty(labelOverride)

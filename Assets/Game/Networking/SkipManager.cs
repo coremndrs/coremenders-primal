@@ -128,6 +128,7 @@ namespace Game.Networking
                 return;
             }
 
+            ClearSkipRequest();          // a skip is starting; any pending request is now moot
             _pendingInterrupt          = null;
             _scheduledInterruptAtStep  = debugInterruptAtStep;
             _skipProgress.Value        = 0f;
@@ -137,6 +138,144 @@ namespace Game.Networking
 
             RuntimeDataManager.Instance?.WorldState?.clock?.Pause();
             StartCoroutine(RunSkipCoroutine(minutes));
+        }
+
+        // ── Commitment skip request (§5.5.3, 0.2.11c5/c6) ────────────────────────
+        //
+        // The wait-or-skip decision, attached to a commitment. A committed dreamer asks to skip
+        // their remaining committed minutes rather than sit through them at 1×.
+        //
+        //   Solo  — proceeds immediately; there is nobody to ask.
+        //   Co-op — surfaces to the partner as a pending request. Accept starts the skip; decline
+        //           clears it and leaves the commitment completely intact (c6). A refusal must
+        //           never lock the committer in: after a decline they can still wait, or cancel
+        //           and keep their progress and their unspent time. That is the whole reason the
+        //           request is separate from the commitment rather than part of it.
+        //
+        // Deliberately NOT reusing ConsensusVoteComponent: that instance is owned by DreamFlowManager
+        // for the Wake Up vote, and a skip request arriving mid-rescue would fight it for the same
+        // NetworkVariables. §4.5's "the skip-start vote reuses this component" is logged in TODO.md.
+
+        private readonly NetworkVariable<int> _skipRequestSlot = new NetworkVariable<int>(
+            -1, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+        private readonly NetworkVariable<int> _skipRequestMinutes = new NetworkVariable<int>(
+            0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+        /// <summary>Slot of the dreamer whose skip request is pending, or -1 when none is.</summary>
+        public int SkipRequestSlot    => _skipRequestSlot.Value;
+        public int SkipRequestMinutes => _skipRequestMinutes.Value;
+        public bool HasPendingSkipRequest => _skipRequestSlot.Value >= 0;
+
+        /// <summary>
+        /// Owner asks to skip the remainder of their commitment (c5). The default length is what
+        /// they still owe on it; an idle dreamer may pass an explicit length instead.
+        /// </summary>
+        [Rpc(SendTo.Server)]
+        public void RequestCommitmentSkipServerRpc(int minutesOverride = -1, RpcParams rpcParams = default)
+        {
+            if (!IsServer || _isSkipping.Value) return;
+            if (!RuntimeDataManager.Instance.TryGetSlotForClient(rpcParams.Receive.SenderClientId, out int slot)) return;
+
+            var world   = RuntimeDataManager.Instance?.WorldState;
+            var dreamer = RuntimeDataManager.Instance?.GetDreamer(slot);
+            if (world?.clock == null || dreamer == null) return;
+
+            int minutes = minutesOverride > 0 ? minutesOverride : DefaultSkipMinutesFor(dreamer, world.clock.totalInGameMinutes);
+            if (minutes <= 0)
+            {
+                Debug.Log($"[SkipManager] Slot {slot} skip request ignored — nothing committed to skip.");
+                return;
+            }
+
+            // Solo: nobody to ask. ConnectedClientsList is the same test the Wake Up vote uses, so
+            // solo behaves consistently across both consent flows.
+            if (NetworkManager.Singleton.ConnectedClientsList.Count <= 1)
+            {
+                Debug.Log($"[SkipManager] Slot {slot} skipping {minutes} min of their commitment (solo).");
+                StartSkip(minutes);
+                return;
+            }
+
+            _skipRequestSlot.Value    = slot;
+            _skipRequestMinutes.Value = minutes;
+            Debug.Log($"[SkipManager] Slot {slot} requested a {minutes} min skip — awaiting partner.");
+        }
+
+        /// <summary>
+        /// How long a skip request defaults to (c5): the minutes the dreamer still owes on their
+        /// active work, whichever way that work is measured.
+        ///
+        /// Object-bound labor has a committed window; a needs task (sleep, rest) and a consumable
+        /// run to a duration instead. Both are "the rest of what I signed up for", and a player
+        /// asking to skip their eight-hour sleep is the single most common case there is — so the
+        /// duration-driven form is not a fallback here, it is half the point.
+        /// </summary>
+        private static int DefaultSkipMinutesFor(DreamerRecord dreamer, float now)
+        {
+            var active = dreamer?.ActiveAction();
+            if (active == null || !active.started) return 0;
+
+            float remaining = active.committedMinutes > 0f
+                ? active.CommittedRemainingAt(now)
+                : Mathf.Max(0f, active.duration - active.ElapsedAt(now));
+            return Mathf.CeilToInt(remaining);
+        }
+
+        /// <summary>Partner answers a pending request. Accept starts the skip; decline clears it and
+        /// changes nothing else (c6).</summary>
+        [Rpc(SendTo.Server)]
+        public void AnswerSkipRequestServerRpc(bool accept, RpcParams rpcParams = default)
+        {
+            if (!IsServer || !HasPendingSkipRequest) return;
+            if (!RuntimeDataManager.Instance.TryGetSlotForClient(rpcParams.Receive.SenderClientId, out int slot)) return;
+            if (slot == _skipRequestSlot.Value) return; // the requester cannot answer their own request
+
+            int minutes = _skipRequestMinutes.Value;
+            ClearSkipRequest();
+
+            if (!accept)
+            {
+                // Non-punitive by construction: nothing about the commitment is touched here.
+                Debug.Log($"[SkipManager] Slot {slot} declined the skip request — commitment left intact.");
+                return;
+            }
+            Debug.Log($"[SkipManager] Slot {slot} accepted — skipping {minutes} min.");
+            StartSkip(minutes);
+        }
+
+        /// <summary>The requester takes their own request back — they decided to wait it out, or to
+        /// cancel the commitment instead. Same no-op-on-the-commitment guarantee as a decline.</summary>
+        [Rpc(SendTo.Server)]
+        public void WithdrawSkipRequestServerRpc(RpcParams rpcParams = default)
+        {
+            if (!IsServer || !HasPendingSkipRequest) return;
+            if (!RuntimeDataManager.Instance.TryGetSlotForClient(rpcParams.Receive.SenderClientId, out int slot)) return;
+            if (slot != _skipRequestSlot.Value) return;
+            ClearSkipRequest();
+            Debug.Log($"[SkipManager] Slot {slot} withdrew their skip request.");
+        }
+
+        private void ClearSkipRequest()
+        {
+            if (!IsServer) return;
+            _skipRequestSlot.Value    = -1;
+            _skipRequestMinutes.Value = 0;
+        }
+
+        /// <summary>
+        /// Whether a dreamer is in a state the skip flow would actually accept (§5.5.3, 0.2.11e2).
+        /// Idle or committed = available; a tripped need guard = not, because the skip would halt on
+        /// its first tick. The in-combat term is a seam — there is no combat system yet.
+        /// </summary>
+        public static bool CanDreamerSkip(DreamerRecord dreamer, NeedsConfig config)
+        {
+            if (dreamer?.needs == null) return false;
+            if (dreamer.isIncapacitated) return false;
+            if (dreamer.needs.hunger < config.GetHungerGuard() * 100f) return false;
+            if (dreamer.needs.thirst < config.GetThirstGuard() * 100f) return false;
+            if (dreamer.needs.warmth < config.GetWarmthGuard() * 100f) return false;
+            return true;
         }
 
         // ── Interrupt channel (0.1.4c) ───────────────────────────────────────────
@@ -184,6 +323,7 @@ namespace Game.Networking
                     actionsEnded.Clear();
                     SimResolver.Step(world, config, buffConfig, sleepEnded, actionsEnded);
                     completed++;
+                    ConvertIdleMinuteToBracket(world, config);
 
                     // Process planned sleep completions for this tick immediately so
                     // the checkpoint captures the tick's state and subsequent ticks
@@ -223,6 +363,39 @@ namespace Game.Networking
             OnSkipComplete(stopReason);
         }
 
+        // ── Idle-skip conversion (§5.5.5, 0.2.11d3) ──────────────────────────────
+
+        /// <summary>
+        /// Moves one minute from the general pool into the trivial bracket for every dreamer who
+        /// passed this skip tick <b>uncommitted</b>. Called once per committed tick, so the
+        /// conversion is exact regardless of chunk size.
+        ///
+        /// The rule it enforces: skipping is not free time. If your partner skips four hours while
+        /// you stand around, those hours were still yours — they come back as bracket minutes you
+        /// can spend on maintenance, not as general labor you could spend on felling. That is what
+        /// stops "skip to refill the day" from being the dominant strategy.
+        ///
+        /// Committed = holding an Active-class slot entry. Sleeping is Active, so sleep does not
+        /// convert (d4 makes that explicit); a dreamer in ghost mode or simply standing idle does.
+        /// </summary>
+        private static void ConvertIdleMinuteToBracket(WorldState world, NeedsConfig config)
+        {
+            if (world?.dreamers == null) return;
+            foreach (var dreamer in world.dreamers)
+            {
+                if (dreamer == null) continue;
+                var active = dreamer.ActiveAction();
+                if (active != null && active.started && active.actionClass == ActionClass.Active) continue;
+
+                // Never convert pool the dreamer does not have — an overdrawn dreamer would
+                // otherwise mint bracket minutes out of their own exhaustion.
+                if (dreamer.timePool < 1f) continue;
+
+                dreamer.timePool     -= 1f;
+                dreamer.trivialBracket += 1f;
+            }
+        }
+
         // ── Action end-effects during skip ───────────────────────────────────────
 
         private static void HandleActionsEnded(List<ActionEndedResult> results)
@@ -245,10 +418,14 @@ namespace Game.Networking
 
             foreach (var dreamer in world.dreamers)
             {
-                if (dreamer?.task == null || dreamer.task.type != TaskType.Sleeping) continue;
+                // 0.2.11a3: sleep lives in the single action slot now. Elapsed is derived from the
+                // clock rather than an accumulated counter, so a skip that advanced the clock in
+                // chunks still reports the exact minutes slept.
+                var active = dreamer?.ActiveAction();
+                if (active == null || active.taskType != TaskType.Sleeping) continue;
 
-                float actualSlept = dreamer.task.elapsedMinutes;
-                dreamer.task = new DreamerTask();
+                float actualSlept = active.ElapsedAt(world.clock.totalInGameMinutes);
+                dreamer.RemoveAt(0);
 
                 OnSleepCutShort?.Invoke(new SleepCutShortResult
                 {
@@ -296,6 +473,13 @@ namespace Game.Networking
 
             var worldForCleanup = RuntimeDataManager.Instance?.WorldState;
             if (worldForCleanup != null) CheckpointCleaner.CleanOrphans(worldForCleanup);
+
+            // 0.2.11b4: an INTERRUPT breaks presence — combat, damage, a predator — so every
+            // contributor is released with progress retained at the interrupt's timestamp. A GUARD
+            // stop is not an interrupt: c7 says a guard-capped skip leaves the commitment
+            // mid-progress to continue at 1×, so the commitment survives and only the skip ends.
+            if (reason != null && reason.Cause == SkipStopCause.Interrupt)
+                MapEntitySync.Instance?.ReleaseAllPresenceOnInterrupt();
 
             if (reason != null)
             {
@@ -357,7 +541,49 @@ namespace Game.Networking
                 }
             }
 
+            DrawSkipRequestPanel(labelStyle);
+
             GUI.color = savedColor;
+        }
+
+        /// <summary>
+        /// The wait-or-skip panel (c5/c6). The requester sees "waiting"; the partner sees Accept /
+        /// Decline. Both stay non-modal — the panel claims the cursor so its buttons are clickable,
+        /// but nothing about the commitment is suspended while it is up (§5.5.3, b5).
+        /// </summary>
+        private void DrawSkipRequestPanel(GUIStyle labelStyle)
+        {
+            bool pending = HasPendingSkipRequest && !_isSkipping.Value;
+            UiFocus.Set(this, pending);
+            if (!pending) return;
+
+            int  requester  = _skipRequestSlot.Value;
+            // NOT RuntimeDataManager.GetOwner: the ownership map is host-side, so on a client it
+            // reports "no owner" for every slot and the requester would be shown their partner's
+            // Accept/Decline buttons — which the server then rejects, leaving them stuck.
+            bool isMine     = DreamerNetworkAdapter.LocalSlot == requester;
+            float hours     = _skipRequestMinutes.Value / 60f;
+
+            float w = 420f, h = 108f;
+            float x = Screen.width / 2f - w / 2f;
+            float y = Screen.height * 0.28f;
+
+            GUI.Box(new Rect(x, y, w, h), "");
+            GUI.Label(new Rect(x, y + 10f, w, 24f),
+                $"Dreamer {requester} wants to skip {hours:F1}h", labelStyle);
+
+            if (isMine)
+            {
+                GUI.Label(new Rect(x, y + 42f, w, 22f), "Waiting for your partner…", labelStyle);
+                if (GUI.Button(new Rect(x + w / 2f - 70f, y + 70f, 140f, 26f), "Withdraw"))
+                    WithdrawSkipRequestServerRpc();
+                return;
+            }
+
+            if (GUI.Button(new Rect(x + 30f, y + 66f, 170f, 30f), "Skip together"))
+                AnswerSkipRequestServerRpc(true);
+            if (GUI.Button(new Rect(x + 220f, y + 66f, 170f, 30f), "Not now"))
+                AnswerSkipRequestServerRpc(false);
         }
     }
 }

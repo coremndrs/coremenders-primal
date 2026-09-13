@@ -1098,22 +1098,82 @@ Net: the per-tick interlock does not grow for Cluster 2 — both condition types
 
 ### 5.5 Time-cost actions & tasks
 
+> **Revision note.** This section supersedes the original §5.5. The timestamp core, the day
+> pool, cost/reservation/refund, object-bound labor accrual, and the resolver/skip/save
+> integration all stand as built (0.2.3–0.2.10). What changes is the **presence model**:
+> committed active labor no longer runs while the dreamer walks away. That single change
+> pulls in an action taxonomy, a commit-and-skip flow, and the trivial bracket. §5.5.14
+> lists exactly what is retired; §5.5.16 covers the retrofit.
+
 Nothing a dreamer does is instant. Every action and task costs time (and usually energy and
 items), runs over a duration, and delivers its effect during or at the end of that window. The
 day is a finite budget you allocate. This is the substrate the deferred Full Scheduler (§4 UI
 backlog) eventually sits on, and it extends GDD §5's energy pool into energy + time.
 
 #### 5.5.0 Core model
+
 An action/task is a timestamp record — `{startTime, duration, …}`; "done" is `clock ≥ start +
 duration`. It is never ticked per-record: it's computed from the synced authoritative clock,
 the same pattern as spoilage (§5.2), the buff window (§4), and the clock itself. Exact on the
 client (computed, not extrapolated), and free under skip and revert by construction.
 
-#### 5.5.1 The day pool
-Each dreamer has a **24h time pool** — a daily *labor budget*, not the wall-clock — that resets
-at 00:00. Everything draws from it (walking, eating, crafting, felling, and sleep/rest/nap),
-with each cost configured per-def. It is *parallelizable*: the two channels (and co-op) let a
-dreamer spend labor faster than the clock advances, so the pool can run dry before midnight.
+**The design problem this revision solves.** Under the original model an active task was
+fire-and-forget: commit four hours to a tree, walk away, collect the log later. That is
+architecturally clean and experientially dead — the dreamer is not present for the work, so
+felling can carry no animation, no sound, no risk, and no sense of labor. It also made the
+world's pressure systems (weather, daylight, temperature, wildlife) irrelevant to work, since
+a player could stack commitments and wander off.
+
+**The rule that fixes it: labor and world time stay welded.** An hour of active labor is an
+hour on the world clock, spent present at the work. What varies is only how much *wall clock*
+the player sits through — either the full 1× duration, or a skip. Nothing decouples pool draw
+from clock advance except the trivial bracket (§5.5.5), which is explicitly bounded and
+explicitly repaid.
+
+**Rejected: variable time scale (N×).** Running the world at 3–10× was considered as a middle
+point between 1× and skip. Rejected on load: at N× the host has `1/N` of the wall-clock budget
+per simulation tick *and* N× the netcode traffic in the same window — physics, character
+controllers, NavMesh, animation, and NGO tick all under a compressed deadline. Load and
+deadline move in opposite directions, and the failure appears only at content scale. Skip does
+not have this problem because it is resolver-only: no physics, no movement, no per-frame
+networking, no frame deadline (§4.2). Do not re-propose N× without a spike that holds the
+tick budget at target entity counts.
+
+**Rejected: per-player time bubbles.** One shared authoritative clock is foundational (§4.5:
+the skip stop is atomic and global). Two dreamers on divergent clocks means two divergent
+world states requiring reconciliation. Not viable; recorded here so it is not re-raised.
+
+#### 5.5.1 Action classes
+
+Every action def declares an **`actionClass`**. This is authored per-def, not derived from
+duration — a duration threshold creates a cliff that every def drifts toward and that players
+feel as a seam. Duration *informs* the choice (nothing multi-hour is Trivial) but does not
+determine it.
+
+| Class | Presence | Wall-clock cost | World-clock cost | Pool draw |
+|---|---|---|---|---|
+| **Active** | Required, locked to the work | full duration at 1×, or a skip | = duration | = duration |
+| **Trivial** | Required, momentary | ~instant (short animation) | none at execution | = duration, from the bracket |
+| **Passive** | None | none | = duration, elapses freely | none (or prep only) |
+
+- **Active** — felling, mining, butchering, building, station crafting, cooking prep. The work
+  the game is about. The dreamer stands at the work animating; the player retains full control
+  (§5.5.3) and may stop at any time.
+- **Trivial** — eating, drinking, sharpening, mending, tending a fire, re-packing a bag.
+  Maintenance whose *instant* execution confers no meaningful advantage. Bounded by the
+  bracket so instant execution can never become a way to buy free hours.
+- **Passive** — curing a hide, drying meat, tanning, fermenting, a kiln firing. A timestamp on
+  the object; it completes when the world clock reaches its end, whether that clock advanced
+  in real time or through a skip. Identical either way, by the tick==jump guarantee (§4.1).
+
+A single def may compose classes: cooking is Active prep followed by Passive simmer. Model
+that as two linked records, not a hybrid class.
+
+#### 5.5.2 The day pool
+
+Each dreamer has a **24h time pool** — a daily *labor budget*, not the wall clock — that resets
+at 00:00. Everything draws from it (walking, eating, crafting, felling, sleep/rest/nap), with
+each cost configured per-def.
 
 **Overdraft is gated.** By default a dreamer cannot commit work they can't pay for — hard stop
 at zero. A per-def `allowsOverdraft` flag, set only on critical survival actions (eat, drink,
@@ -1121,111 +1181,296 @@ bandage, emergency snow shelter), lets them push past zero for the rare miscalcu
 would otherwise be lethal; overdraft applies an exhaustion debuff and is meant to be a painful
 exception, not a strategy.
 
-**Refill** is the full 24h at 00:00 for now. If the all-at-once grant feels off in playtesting
-it may become segmented/rolling (e.g. 8h every 8h) — tunable, not locked.
+**Refill** is the full 24h at 00:00 (see §5.5.5 for how the trivial bracket resets alongside).
 
-#### 5.5.2 Channels
-Two independent channels — **Action** (short, survival) and **Task** (long: craft/gather/
-build/fell) — each with 1 active slot + FIFO queue that auto-advances. A dreamer runs at most
-1 action + 1 task at once. In practice the action channel is sparse and the bulk of time goes
-to tasks, so the parallel-overspend case is an edge, not the norm.
+**What the pool actually constrains.** Under this revision a dreamer working serially spends
+pool and clock in lockstep — midnight arrives at the same moment either way, so the pool does
+not bind *independently* in that case. It binds through three channels, and those are the
+tuning levers:
 
-#### 5.5.3 Cost, reservation & payout
-Time, energy, and item inputs are all reserved/debited at **assign** (queue), not when the slot
-reaches the item. Progress = `(clock − start)/duration`. Two payout shapes:
-- **Gradual** — installs a timed buff (reuse the §4 buff system) that the relevant resolver
-  stage reads as a +rate. An apple = a 5-min nourishment buff at +10 nutrition/min. This is how
-  0.1.1's placeholder meal finally becomes real: a rate over a window, not an instant bump.
-- **End-payout** — nothing until completion, then deliver the output (spawn item(s), raise a
-  structure, fell the tree).
+1. **The trivial bracket** — the only sanctioned way to spend labor faster than the clock.
+2. **Co-op stacking** — two contributors on one object burn two pool-hours per clock-hour.
+3. **Non-labor clock loss** — idle skips, waiting, interrupted work: clock spent, pool not
+   converted (except via the bracket).
 
-#### 5.5.4 Cancel, pause & resume
-Queued → full refund. In-progress → refund the **unelapsed** time + energy and materialize the
-spent part as a resumable artifact:
-- consumable → a partial item ("apple 30/50") — non-stackable, instance-level `remaining`;
-- self-contained craft → an in-progress item in inventory;
-- object-bound task → progress saved on the object (§5.6.5).
+The pool remains a hard cap — no dreamer exceeds 24h, and no progression extends it (GDD §5).
+Its felt role is allocation and legibility as much as scarcity; tune the three levers above,
+not the 24h number.
 
-#### 5.5.5 Object-bound tasks & co-op labor accrual
-Felling, station crafting, and building live on the MapEntity object: the dreamer commits labor
-and is then free to walk away; the output waits **at the object** for collection. The object
-carries `requiredLabor` + `accumulatedLabor` and accrues via piecewise-linear segments
-`{segmentStart, rate, accumulatedAtStart}`, where rate = sum of active contributors (1× each,
-later tool/skill-scaled). Completion is **re-projected only at contributor-change events**
-(`= segmentStart + (required − accumulated)/rate`); between events it's the §5.6.0 timestamp
-model. A single-contributor self-contained task is the one-segment degenerate case.
+#### 5.5.3 Active actions — commit, presence, wait or skip
 
-On assign a contributor sets `committedLabor` (default = remaining required), drawn from their
-pool; they contribute until that's spent or the task completes, and unspent committed labor
-refunds on completion (same rule as cancel). A task left short of `requiredLabor` simply sits
-partial on the object, resumable by anyone — unifying pause/resume with co-op.
+An active action **binds the dreamer to the work**. They animate at the object; the action
+progresses only while they remain. Leaving is a cancel (§5.5.4).
 
-*Worked example:* a 4h tree. P1 fells [0→2] at 1× (2/4), gap [2→3] at 0× (P1 spent their 2h,
-P2 still on a prior task), P2 fells [3→5] (4/4) → felled at 5h. Both felling together instead →
-2× rate, done at ~2h.
+**Presence does not mean modal lock.** This distinction is load-bearing — the whole model
+rests on the waiting case being tolerable. While committed the player retains: camera control,
+inventory, map, the tribe/needs panel, queueing the next action, ghost planning mode
+(§7.1), and instant cancel. What they cannot do is *move the body*. A player waiting out six
+real minutes of chopping should be spending them planning, not watching a loop with no input
+accepted. Do not build the cutscene version.
 
-#### 5.5.6 Where state lives
-Self-contained records live on the dreamer (DreamerRecord); object-bound progress lives on the
-MapEntity (§1.11 layer), so it rides per-map sync and the partner sees your half-felled tree.
-The dreamer's task slot holds a handle while an object-bound task is active.
+**Two ways to pay the wall clock:**
 
-#### 5.5.7 Movement drain
-Walking drains both **time and energy per distance** (rates in a movement config asset, not a
-per-action def). It's a real-time-only per-tick debit (distance moved that tick → time +
-energy) on the resolver; skip doesn't move the dreamer, so it doesn't apply during skip. This
-makes trips and map size genuinely cost something — players plan routes and avoid wasted
-travel, which feeds the migration / cross-map design (GDD §19–§20).
+- **Wait at 1×** — 1 IG hour = 360 real seconds. Always available, needs no one's agreement.
+- **Skip** — the existing Skip Time flow (§4.2, §4.5). Advances the world clock across the
+  commitment; the action completes inside the skip via the ordinary resolver path. Requires
+  co-op agreement, is capped by guards, and halts on interrupt.
 
-#### 5.5.8 Daylight, night & light (→ Cluster 5)
-A per-def `timeOfDay` (Daylight | Night | Anytime) gates *when* a task may run against the
-world clock's day; Night tasks burn a light-source consumable over their duration (the same
-gradual-consume mechanic). Daylight bounds vary by season. This half depends on the world/
-season system — ship the `timeOfDay` + light-source def fields now, inert (default Anytime),
-and activate them when **Cluster 5** lands day-length and the season curve.
+**Skip is a request, not a property of the commitment.** Committing does not entail skipping.
+The player commits, then may request a skip; if the partner declines or is unavailable, the
+committer waits at 1× or cancels with progress retained. A refused skip must never leave the
+committer stuck — that would make asking punitive, and players would stop asking.
 
-#### 5.5.9 Resolver, skip & save
-One resolver still. Each tick it (a) applies active gradual buffs as need-rates and (b) fires
-completions whose end ≤ now, in deterministic `(completionTime, owner, channel)` order — so
-real-time and skip share one path and tick==jump holds ("queue a 4h build, skip 4h, it's done"
-for free). A per-def `interruptsSkip` flag stops an in-flight skip on completion via the 0.1.4c
-channel. Records are authoritative state → in the save (self in DreamerRecord, object in the
-map layer); revert's clear-and-rehydrate restores in-flight work correctly because everything
-is timestamp-derived. (This extends the resolver's per-tick work — new scope beyond the
-original C2 plan, and it warrants its own build.)
+**Guard-cap interaction.** A skip may be capped below the requested duration by a dreamer
+guard or halted by an interrupt (§4.5). The commitment does not fail: the clock advances as far
+as the skip ran, labor accrues for exactly that span, and the remainder is left in progress at
+1×. Commitment and skip are independent — one is a labor reservation, the other is a
+clock-advancement mechanism.
 
-#### 5.5.10 Networking
-Host-authoritative: assign/cancel/complete are host operations; the client sends intents (the
-pickup/drop flow from §5.4). A dreamer's owned action/task queues replicate to the owning
-client; object-bound progress rides per-map sync. Progress bars are client-computed from the
-synced records + clock — exact, no extrapolation.
+**Co-op is the intended path.** Two dreamers on the same object accrue at 2× (§5.5.7) *and*
+trivially satisfy the skip-agreement condition. The design's answer to "one works while the
+other wanders" is not a mechanism — it is that co-op work is faster, skippable, and safer, and
+the split case is an accepted 1× cost the player can exit at any time.
 
-#### 5.5.11 Per-def fields
+#### 5.5.4 Cancel & retained progress
+
+**A player may stop an active action at any time, and progress is kept.** No cancellation
+penalty, no lost chunk. This is a deliberate trade: it makes the wait case non-punitive and
+lets a player respond instantly to a partner in trouble, at the cost of making a large
+commitment strictly safer than a small one (see the open decision in §5.5.15 on whether
+commitment length should be player-chosen at all).
+
+Refund and materialization on cancel, as built:
+
+- Queued → full refund of time, energy, and item inputs.
+- In-progress → refund the **unelapsed** time + energy; the spent part materializes as a
+  resumable artifact:
+  - consumable → a partial item ("apple 30/50") — non-stackable, instance-level `remaining`;
+  - self-contained craft → an in-progress item in inventory;
+  - object-bound task → progress saved on the object (§5.6.5).
+
+**Resumable by either dreamer.** Partial object progress is object state, not owner state, so
+B can finish A's half-felled tree. Abandoning work is socially fine, not wasteful — which is
+what makes cancel-anytime safe to offer.
+
+**Abandoned progress does not decay.** A node left at 67% sits at 67% indefinitely. Decay was
+considered and rejected: it punishes the responsiveness this rule exists to enable.
+
+#### 5.5.5 Trivial actions & the bracket
+
+A trivial action executes in ~1 second of wall clock, advances the world clock by nothing, and
+debits its full duration from the dreamer's **trivial bracket**.
+
+**Why a bracket and not a micro-skip.** Advancing the shared world clock for a 15-minute meal
+is unilateral: it costs the partner 15 minutes of their day without their agreement. The
+bracket removes unilateral clock movement entirely — the labor is spent now, the clock is paid
+later, at a skip both players agreed to.
+
+**Bracket rules:**
+
+- The bracket is a **reserved sub-pool** of the 24h pool — hours inside it can be spent *only*
+  on trivial actions, never on active work.
+- It **resets to its daily base** (starting value: 1h) at wake. Sleep resets it; sleep does
+  **not** convert into it.
+- It **grows through idle-skip conversion**: when a dreamer passes a skip without engaging in
+  labor, the skipped hours move from their general pool into the bracket. Skip 2h idle → 2h
+  reserved for trivial actions.
+- Conversion is a strict **downgrade in flexibility** — general hours become trivial-only
+  hours. It cannot be farmed for advantage; it converts otherwise-dead time into something.
+- **Unspent bracket hours are lost at sleep.** Players may burn remaining trivial hours before
+  bed. (Planned successor: convert leftover into rest quality / energy recovery — §5.5.15.)
+- A per-def **`allowsCriticalBypass`** permits execution on an empty bracket for survival
+  actions (eating while starving, bandaging while bleeding). Same list and reasoning as
+  `allowsOverdraft`; a bookkeeping cap must not be able to kill a dreamer.
+
+**What the bracket is for.** Its purpose is not accounting — it is **removing the cost of
+agreeing to a skip**. Without it, every skip request forces the partner to weigh hours they are
+about to waste, so routine coordination becomes a negotiation. With it, idle time converts into
+capacity for the daily maintenance that must happen anyway, and the answer to "can we skip 2h?"
+is simply yes. **Tune against that test**: if the bracket is too small to absorb a typical
+day's maintenance, it has failed at its job even if the arithmetic is sound.
+
+Reference load: eat 15 + drink 10 + sharpen 10 + mend 20 = 55 min. The 1h base is load-bearing,
+not arbitrary.
+
+#### 5.5.6 Passive processes
+
+A passive process is a timestamp record on the object: `{startTime, duration}`, complete when
+`clock ≥ start + duration`. No presence, no pool draw, no dreamer slot. Real time and skip are
+identical by construction (§4.1) — a hide started at 10:00 with a 6h cure is done at 16:00
+whether those hours were played or skipped.
+
+Passive processes are where "set it and forget it" belongs. Removing it from felling is the
+point of this revision; keeping it for drying racks and kilns is equally the point.
+
+#### 5.5.7 Object-bound tasks & co-op labor accrual
+
+Felling, station crafting, and building live on the MapEntity object. The object carries
+`requiredLabor` + `accumulatedLabor` and accrues via piecewise-linear segments
+`{segmentStart, rate, accumulatedAtStart}`, where rate = sum of **present** contributors
+(1× each, tool/skill-scaled per §5.6.1–5.6.2). Completion is re-projected only at
+contributor-change events (`= segmentStart + (required − accumulated)/rate`); between events it
+is the timestamp model.
+
+**The change from the original: rate counts present contributors, not committed ones.** A
+contributor joins on commit-and-arrive and leaves on cancel, on moving away, or on interrupt.
+Each of those is an ordinary contributor-change event — the accrual machinery is unchanged, only
+the trigger set is.
+
+On commit a contributor sets `committedLabor` (default = remaining required), drawn from their
+pool; they contribute until it is spent or the task completes, and unspent committed labor
+refunds on completion or cancel. A task left short of `requiredLabor` sits partial on the
+object, resumable by anyone.
+
+*Worked example (revised).* A 4h tree. P1 commits and fells [0→2] at 1× → 2/4, then cancels to
+go eat: 2h of commitment refunded, tree sits at 50%. Gap [2→3] at 0× — nobody present, the tree
+does not progress. P2 arrives and fells [3→5] → 4/4, felled at 5h. Both felling together
+instead: 2× rate, done at ~2h, and the pair can skip the whole thing in one agreement.
+
+#### 5.5.8 Where state lives
+
+Self-contained records live on the dreamer (DreamerRecord) — including the day pool and the
+trivial bracket. Object-bound progress and passive processes live on the MapEntity (§1.11
+layer), so they ride per-map sync and the partner sees your half-felled tree. The dreamer's
+active slot holds a handle while an object-bound task is active.
+
+#### 5.5.9 Movement
+
+Walking drains **time and energy per distance** (rates in a movement config asset, not a
+per-action def) — a real-time-only per-tick debit on the resolver. Skip does not move the
+dreamer, so it does not apply during skip. This makes trips and map size cost something and
+feeds the migration / cross-map design (GDD §19–§20).
+
+Movement is not an action class: it is a continuous drain, not a committed record. It is,
+however, a case of clock advancing while labor converts at a fixed rate — which is why walking
+does not qualify a dreamer as "idle" for bracket conversion.
+
+#### 5.5.10 Daylight, night & light (→ Cluster 5)
+
+A per-def `timeOfDay` (Daylight | Night | Anytime) gates when a task may run against the world
+clock's day; Night tasks burn a light-source consumable over their duration. Daylight bounds
+vary by season. Ship the def fields inert (default Anytime); activate at **Cluster 5** with
+day-length and the season curve.
+
+This revision *restores the meaning* of GDD §5's daylight/night sub-pools. Because active labor
+advances the world clock 1:1, ten hours of felling genuinely runs the sun down — the sub-pools
+constrain real decisions again, which they would not under a decoupled model.
+
+**Boundary rule (C5):** a commitment that crosses a `timeOfDay` boundary halts at the boundary
+with progress retained, rather than being pre-capped at commit. Same shape as the guard-cap
+rule (§5.5.3) — one rule, two triggers.
+
+#### 5.5.11 Resolver, skip & save
+
+One resolver. Each tick it (a) applies active gradual buffs as need-rates and (b) fires
+completions whose end ≤ now, in deterministic `(completionTime, owner, class)` order — so real
+time and skip share one path and tick==jump holds. A per-def `interruptsSkip` flag stops an
+in-flight skip on completion via the 0.1.4c channel.
+
+**Interrupt → presence.** An interrupt that stops a skip (§4.5) also ends presence for any
+active commitment: contributors leave, accrual stops at that instant, progress is retained.
+A predator arriving at tree seven of ten is the intended drama, and it now costs the player
+partial work rather than nothing.
+
+Records are authoritative state → in the save (self in DreamerRecord, object in the map layer);
+revert's clear-and-rehydrate restores in-flight work correctly because everything is
+timestamp-derived. The trivial bracket is a DreamerRecord field and rides the same path.
+
+#### 5.5.12 Networking
+
+Host-authoritative: commit / cancel / complete are host operations; the client sends intents
+(the pickup/drop flow from §5.4). A dreamer's owned records replicate to the owning client;
+object-bound progress rides per-map sync. Progress bars are client-computed from the synced
+records + clock — exact, no extrapolation.
+
+**Partner visibility is a requirement, not polish.** Skip coordination is only cheap if each
+player can see at a glance whether the other can skip. The HUD needs a partner status element:
+vitals, needs, in-combat flag, engaged/idle/can-skip state, and map position. Without it every
+coordination beat becomes a chat message, which is precisely the friction this design is
+trying to avoid. Same element serves the deferred skip-consensus UI (§4.5).
+
+#### 5.5.13 Per-def fields
 
 | Field | Applies to | Meaning |
 |---|---|---|
-| `channel` | all | Action or Task |
-| `timeCost` | action / self-contained | labor-hours = pool draw = duration at 1× rate |
-| `energyCost` | all | energy drawn (GDD §5 pool) |
-| `itemInputs` | consume / craft | items consumed on assign |
+| `actionClass` | all | **Active / Trivial / Passive** (§5.5.1) |
+| `timeCost` | Active / Trivial | labor-minutes = pool draw = duration at 1× rate |
+| `energyCost` | Active / Trivial | energy drawn (GDD §5 pool) |
+| `itemInputs` | consume / craft | items consumed on commit |
 | `requiredLabor` | object-bound | total labor to complete (on object/recipe) |
-| `isObjectBound` | tasks | self-contained vs object-bound |
+| `isObjectBound` | Active | self-contained vs object-bound |
 | `payout` | all | Gradual (buff rate + window) / EndItem / EndEffect |
-| `timeOfDay` | all | Daylight / Night / Anytime — inert until C5 |
-| `lightBurn` | Night tasks | light-source consumed over duration — inert until C5 |
+| `allowsCriticalBypass` | Trivial | **new** — executes on an empty bracket (survival only) |
 | `allowsOverdraft` | all | default false; true only for critical survival |
 | `overdraftDebuff` | overdraft-allowed | debuff applied when overdrafted |
 | `interruptsSkip` | all | default false; stops an in-flight skip on completion |
+| `timeOfDay` | all | Daylight / Night / Anytime — inert until C5 |
+| `lightBurn` | Night tasks | light-source consumed over duration — inert until C5 |
 
 Movement uses a separate config asset: `timePerMeter`, `energyPerMeter`.
+Bracket tuning lives in a config asset: `trivialBracketDailyBase` (start: 60 min).
 
-#### 5.5.12 Build phasing
+#### 5.5.14 What this revision retires
 
-| Piece | Lands |
+| Retired | Replaced by |
 |---|---|
-| Day pool + reserve/spend/refund + overdraft gating + Action channel + eating (gradual buff) | 0.2.3 (action framework) — retrofits the shipped 0.2.2 instant consume |
-| Movement drain (time + energy / distance) | 0.2.3 (with the action framework) |
-| Task channel + object-binding + co-op labor accrual + in-progress/resumable | gathering / processing (0.2.7–0.2.8) |
-| Daylight / night / light-source activation | Cluster 5 (season + day-length); def fields ship inert now |
+| "The dreamer commits labor and is then free to walk away" (old §5.5.5) | Presence-bound active labor (§5.5.3, §5.5.7) |
+| `channel` = Action / Task as the primary taxonomy | `actionClass` = Active / Trivial / Passive (§5.5.1) |
+| Two simultaneous slots as the parallelism mechanism | The trivial bracket as bounded, sanctioned parallelism (§5.5.5) |
+| Rate = sum of *committed* contributors | Rate = sum of *present* contributors (§5.5.7) |
+| Variable time scale (N×) | Not built — rejected on load (§5.5.0) |
+
+The two-channel model is the one genuine deletion of shipped structure, and it is proposed
+rather than settled — see §5.5.15.
+
+#### 5.5.15 Open decisions
+
+1. ~~**Do the two channels retire?**~~ **Resolved — they collapse to one active slot**, with
+   the FIFO queue surviving on it as a queue-ahead convenience. The second channel existed to
+   let a dreamer outpace the clock; the bracket now does that, bounded. Built in 0.2.11a.
+2. ~~**Is commitment length player-chosen?**~~ **Resolved — yes, with a max shortcut.** Tap
+   interact opens a duration menu; hold interact commits the maximum (= min(remaining labor,
+   available pool)). This defuses the "largest is always optimal" concern by making max the
+   one-gesture default: the menu becomes a deliberate override for partial commits, not a trap
+   the player must reason past. Skip requests default to remaining committed duration.
+   Built in 0.2.11c.
+3. **Chunk granularity for accrual and exit points.** Finer chunks lower the worst-case wait
+   before a clean exit and let a partner join sooner. Drives how bad the split case feels;
+   worth pinning before tuning anything else.
+4. **Bracket base value** — 1h is a starting number against a ~55 min reference load. Test
+   against the "is a skip request answered without hesitation" criterion, not arithmetic.
+5. **Does a bracket ceiling exist?** Idle-skip conversion is currently uncapped. If forced
+   conversion during long partner skips starts to bite, cap it (~2h) beyond which idle skips
+   simply do not convert.
+6. ~~**Trivial at an empty bracket**~~ **Resolved — fall back to Active** at full duration
+   rather than hard-blocking. Forgiving, and it keeps the critical-bypass list short.
+   Built in 0.2.11d6.
+7. **Leftover bracket → rest quality** (planned, not scheduled). Converting unspent trivial
+   hours into rest/energy recovery removes the nightly burn-it-or-lose-it ritual, which is the
+   highest-frequency interaction in the system and the most likely to grate.
+8. **Skip-start consensus** — still deferred (§4.5). This revision raises its priority: skip is
+   now the primary co-op coordination beat, not an occasional convenience.
+
+#### 5.5.16 Build phasing
+
+| Piece | Status / lands |
+|---|---|
+| Day pool, reserve/spend/refund, overdraft gating, movement drain | **Shipped** (0.2.3) — unchanged |
+| Object-bound accrual, co-op segments, partial/resumable progress | **Shipped** (0.2.7–0.2.8) — trigger set changes only |
+| Crafting, durability, processing chains | **Shipped** (0.2.6–0.2.10) — reclassify defs, no structural change |
+| `actionClass` + def reclassification + channel collapse to one slot | **0.2.11a** |
+| Presence binding: contributor join/leave on arrive/leave/cancel/interrupt | **0.2.11b** |
+| Commit flow (tap-menu / hold-max), wait-or-skip, partial-skip remainder | **0.2.11c** |
+| Trivial bracket: reserved sub-pool, idle-skip conversion, wake reset, bypass | **0.2.11d** |
+| Partner status HUD + can-skip indicator | **0.2.11e** |
+| Ghost planning mode | §7.1 — Cluster 4 (needs the blueprint system) |
+| Daylight / night / light-source activation | Cluster 5 |
+
+**Retrofit shape.** Shipped as a single build, **0.2.11** (detailed breakdown in §5.8). One
+genuine deletion — the second action channel. Everything else is additive: a def-authoring
+pass, a widened trigger set for contributor-change events, a UI/flow layer over the existing
+skip machinery, and one new DreamerRecord field. The accrual math, the timestamp model, the
+resolver, and save/revert are untouched.
 
 ### 5.6 Gathering
 
@@ -2421,3 +2666,335 @@ body; culling and shadow-only are owner-local (not applied to remote bodies).
   bugs), shadow preserved; owner-local so remotes are unaffected.
 - **Presentation-only, two seams** — movement drain reads the transform result; the interaction ray
   feeds InteractableDetector. No simulation or host involvement (movement is client-authoritative).
+
+---
+
+#### 0.2.11 — Action & time model revision — detailed
+
+The §5.5 revision, as one build. Committed active labor becomes **presence-bound**: a dreamer
+stands at the work and the work stops when they leave. That single change pulls in the
+Active/Trivial/Passive taxonomy (a), the presence rules themselves (b), a commit flow with a
+wait-or-skip decision attached (c), and the trivial bracket that keeps maintenance actions from
+costing six real minutes each (d). (e) adds the partner status element without which none of
+the co-op coordination is usable.
+
+Nothing is rewritten from scratch. The timestamp core, the day pool, reserve/spend/refund, the
+piecewise-linear accrual engine (`ProcessableInstance`), the resolver, and save/revert are all
+untouched. What changes is *when contributor-change events fire*, plus one new DreamerRecord
+field and a UI layer over the existing skip machinery.
+
+**Channel decision (§5.5.15 #1 — resolved).** The two channels **collapse to one active slot**.
+The second channel existed so a dreamer could spend labor faster than the clock; the trivial
+bracket now does that job with a bound on it, and a presence-bound dreamer is by definition
+doing one thing. Trivial actions need no slot (they resolve instantly), Passive processes live
+on objects, so a single slot covers every remaining case. The **FIFO queue survives** on that
+slot as a queue-ahead convenience — it is what makes the 1× wait tolerable, since the player
+can line up the next two actions while standing at the tree.
+
+##### 0.2.11a — Action classes + slot collapse — code done (a2/a4 authoring + validation pending)
+
+| ID | Task | Executor | Done when |
+|---|---|---|---|
+| a1 | `ActionClass` enum (Active / Trivial / Passive) + `actionClass` field on the action Def; `ActionRecord` carries it. Registry resolves it. | Claude Code | Every action Def declares a class; the record knows which it is. |
+| a2 | **Reclassification pass** over existing Defs: eat/drink/sharpen/mend → Trivial; fell/mine/butcher/craft/build/sleep/rest → Active; drying/curing/tanning → Passive. | Manual | Every shipped Def has an authored class; none defaults implicitly. |
+| a3 | **Collapse the two channels to one active slot.** `DreamerRecord` holds one active `ActionRecord` + the FIFO queue; the second channel and its queue are removed. Queue auto-advance behaviour is preserved on the surviving slot. | Claude Code | A dreamer runs one active action at a time; queueing ahead still works; no orphaned second-channel state in the save. |
+| a4 | `allowsCriticalBypass` bool on the Def, **inert** until d5. Authored true only on the `allowsOverdraft` survival list. | Split — schema: Claude Code; authoring: Manual | The field exists and is authored; nothing reads it yet. |
+| a5 | Save migration: an existing save with two channels loads with the Task-channel record promoted to the single slot and any Action-channel record discarded (dev-stage saves, so no ceremony required). | Claude Code | An older save loads without exception on both clients. |
+
+*Acceptance:* every Def is classed; a dreamer holds exactly one active slot; queue-ahead works;
+a pre-revision save loads clean; save/revert-clean on two clients.
+
+##### 0.2.11b — Presence binding — code done (b5 UI gating + validation pending)
+
+| ID | Task | Executor | Done when |
+|---|---|---|---|
+| b1 | **Presence predicate:** a dreamer contributes to an object-bound task only while within the task's interaction range of the object and not committed elsewhere. Leaving range fires a contributor-change event. | Claude Code | Walking away from a tree stops its progress; walking back does not auto-resume (requires re-commit). |
+| b2 | `ProcessableInstance` accrual rate = sum of **present** contributors (was: committed contributors). The segment math is unchanged — only the event trigger set widens. | Claude Code | A tree with one contributor who leaves accrues at 0× for the gap and retains progress. |
+| b3 | Self-contained Active actions (hand-craft, rest, sleep) also bind presence: moving the body cancels them per §5.5.4 refund rules. | Claude Code | Moving mid-hand-craft cancels it and materialises the in-progress item. |
+| b4 | **Interrupt → presence end.** Subscribe presence release to the 0.1.4c interrupt channel: a skip-stopping interrupt, combat, damage, or a guard trip ends contribution at that instant with progress retained. | Claude Code | A simulated interrupt mid-fell stops accrual at that timestamp; the tree holds partial progress. |
+| b5 | **Non-modal guarantee (§5.5.3):** while committed, camera, inventory, map, tribe/needs panel, queueing and cancel all remain live. Only body movement is blocked (and attempting it cancels per b3). | Split — logic: Claude Code; UI gating: Manual | Every listed panel opens during a commitment; movement input cancels rather than being swallowed. |
+
+*Acceptance:* two dreamers fell one tree at 2×; one leaves → 1×; both leave → 0× with progress
+held; either can resume; an interrupt ends presence cleanly; all panels usable while committed;
+save/revert-clean on two clients.
+
+> **b4 vs c7 — resolved in favour of c7 (as built).** b4 lists "a guard trip" among the events that
+> end contribution, but c7 requires a guard-capped skip to leave the commitment mid-progress and
+> continue at 1×. Both cannot hold. As built: an **Interrupt** stop releases all presence; a **guard**
+> stop leaves the commitment running. That keeps the §0.2.11 acceptance script coherent (nothing in
+> it says a guard stop drops the commitment) and is the more forgiving reading. Fold this into the
+> b4 wording next time §5.5 is edited.
+
+##### 0.2.11c — Commit flow: duration menu, hold-for-max, wait-or-skip — code done (c1/c2/c8 layout + validation pending)
+
+| ID | Task | Executor | Done when |
+|---|---|---|---|
+| c1 | **Tap interact → duration menu.** Presents commit options for the targeted action (e.g. 15m / 30m / 1h / remaining), capped at the lesser of remaining labor and the dreamer's available pool. Options below the cap are never offered. | Split — logic: Claude Code; menu layout: Manual | Tapping interact on a tree offers valid durations only; an over-cap option is never shown. |
+| c2 | **Hold interact → commit maximum** (= min(remaining labor, available pool)), skipping the menu. Verify the hold binding does not collide with the FP precision-mode hold (Group E, e3) — use a distinct binding if it does. | Split — logic: Claude Code; binding: Manual | Holding interact commits the max directly; precision mode still works and the two gestures do not conflict. |
+| c3 | Commit reserves the chosen duration from the day pool; unspent reservation refunds on completion **or** cancel. Over-commitment beyond remaining labor is impossible by c1/c2 capping. | Claude Code | Committing 1h to a 20m remainder is not offerable; a partial commit refunds correctly. |
+| c4 | **Cancel anytime, progress retained** — re-verify the shipped §5.5.4 refund/materialise paths against the new presence rules; no cancellation penalty, no lost chunk. | Claude Code | Cancel at any point refunds unelapsed time/energy and leaves resumable progress. |
+| c5 | **Skip request attached to a commitment.** A committed dreamer can request a skip defaulting to their remaining committed duration. Solo: proceeds. Co-op: routes through the skip agreement flow. | Claude Code | A solo dreamer skips their own commitment; a co-op request surfaces to the partner. |
+| c6 | **Refused/unavailable skip is non-punitive.** A declined request leaves the commitment intact and freely cancellable; it never locks the committer in. | Claude Code | Declining a skip request leaves the committer able to wait or cancel immediately. |
+| c7 | **Partial-skip remainder (§5.5.3).** A skip capped by a guard or stopped by an interrupt advances the clock only as far as it ran; labor accrues for exactly that span and the remainder continues at 1×. | Claude Code | A guard-capped skip leaves the commitment mid-progress at 1× with correct labor accrued. |
+| c8 | Progress/commitment HUD: remaining labor, committed duration, elapsed, and a cancel affordance — client-computed from synced record + clock, no extrapolation. | Split — logic: Claude Code; layout: Manual | The bar is exact on both clients and matches after a revert. |
+
+*Acceptance:* tap-menu and hold-max both commit correctly and are capped; cancel retains progress;
+a solo skip completes a commitment inside the skip; a co-op request is surfaced and a refusal is
+harmless; a guard-capped skip leaves a correct 1× remainder; save/revert-clean on two clients.
+
+##### 0.2.11d — Trivial bracket — code done (d1 base value + d7 layout + validation pending)
+
+| ID | Task | Executor | Done when |
+|---|---|---|---|
+| d1 | `trivialBracket` (remaining minutes) on `DreamerRecord`; `trivialBracketDailyBase` in a config asset (start: 60). Serialised, synced, revert-clean. | Split — logic: Claude Code; base value: Manual | The field persists and replicates; revert restores it. |
+| d2 | **Trivial execution:** resolves in ~1s of wall clock, advances the world clock by **nothing**, debits `timeCost` from the bracket. Blocked when the bracket is short (see d6). | Claude Code | Eating executes near-instantly, debits the bracket, and does not move the clock. |
+| d3 | **Idle-skip conversion:** hours a dreamer passes in a skip without an active commitment move from the general pool into the bracket. A dreamer in ghost mode or simply idle counts as idle; a committed one does not. | Claude Code | A 2h skip with one dreamer idle grows that dreamer's bracket by 2h and shrinks their general pool by 2h. |
+| d4 | **Wake reset:** at wake the bracket resets to `trivialBracketDailyBase`. Sleep does **not** convert into it, and unspent bracket hours are lost at sleep. | Claude Code | Sleeping resets the bracket to base regardless of what it held; leftover does not carry. |
+| d5 | **Critical bypass:** Defs with `allowsCriticalBypass` execute on an empty bracket (eat while starving, bandage while bleeding). Activates the a4 field. | Claude Code | A starving dreamer can eat with an empty bracket; a non-critical trivial action cannot. |
+| d6 | **Insufficient-bracket behaviour** (§5.5.15 #6): the trivial action falls back to executing as an Active action at its full duration rather than being hard-blocked. Keeps the model forgiving without widening the bypass list. | Claude Code | With an empty bracket, sharpening runs as a normal Active action instead of failing. |
+| d7 | Bracket HUD readout alongside the day pool, visually distinct so trivial-only hours don't read as spendable on work. | Manual | The player can see bracket and general pool separately at a glance. |
+
+*Acceptance:* trivial actions execute instantly and debit the bracket without moving the clock;
+an idle skip converts pool → bracket; wake resets to base and leftovers are lost; critical bypass
+works and is limited to authored Defs; empty-bracket fallback runs as Active; save/revert-clean on
+two clients.
+
+##### 0.2.11e — Partner status HUD — code done (e1 layout + validation pending)
+
+| ID | Task | Executor | Done when |
+|---|---|---|---|
+| e1 | Partner status element: vitals, needs, in-combat flag, engaged/idle state, and map position, synced from the partner's DreamerRecord. | Split — logic: Claude Code; layout: Manual | Each client sees the other's live status without opening a panel. |
+| e2 | **Can-skip indicator** derived from the partner's state (idle or committed = available; in combat or guard-tripped = not). This is what makes skip coordination a glance rather than a chat message. | Claude Code | The indicator flips correctly as the partner commits, idles, and enters combat. |
+
+*Acceptance:* both clients show accurate live partner status; the can-skip indicator matches what
+the skip flow will actually accept.
+
+##### 0.2.11 acceptance (combined, 2-client)
+
+Two dreamers, one map. A commits to felling via hold-interact; B walks over and joins; the tree
+accrues at 2×; B leaves and it drops to 1×. A requests a skip while B is away — B's indicator
+shows unavailable, A declines to wait and cancels; the tree holds partial progress and A's
+unspent time refunds. B returns, both commit, both agree to skip, and the tree completes inside
+the skip with correct labor and clock advance. Meanwhile B, idle through an earlier 2h skip, has
+2h of bracket and eats and sharpens instantly without moving the clock. A, with an empty bracket,
+sharpens as a full Active action instead. Both sleep; brackets reset to base and leftovers are
+lost. Save/revert-clean throughout, with progress bars exact on both clients after a revert.
+
+---
+
+## 6. Cluster 3 — Wildlife, Combat & Harvesting: Design
+
+*Not yet scoped. Reserved so chapter numbering tracks the §3 cluster roadmap.*
+
+---
+
+## 7. Cluster 4 — Structures & Building: Design
+
+*Partially scoped. Only §7.1 is written; the blueprint/placement system, construction stages,
+structure types and decay (GDD §14) are scoped when the cluster is taken up.*
+
+### 7.1 Ghost Planning Mode
+
+> **Written ahead of its cluster.** This is Cluster 4 work — it needs the blueprint/placement
+> system to have anything to plan. It is designed now because the §5.5 revision's 1× waiting
+> case depends on it existing, and because it is the attachment point for the Camp Management
+> System and the Full Scheduler. See §7.1.9 for the resulting phasing gap.
+
+#### 7.1.0 What it is
+
+A dreamer can enter **ghost planning mode**: a disembodied camera that relocates to a known
+location on the same map — normally the base — and edits a **plan layer** of ghost walls,
+structures and furniture. Nothing in the plan is real. It costs no materials, no labor, and no
+world time. It is a drafting table, and what it produces is blueprints that someone must later
+build with actual materials and hours (GDD §14).
+
+Two things motivated it, and the second is the one that matters long-term:
+
+1. **It fills the §5.5 waiting case.** A dreamer committed to an hour of felling, whose partner
+   can't skip, spends six real minutes present at the tree. Ghost mode makes those minutes
+   productive without touching the world clock or the presence rule.
+2. **It is the right home for remote base interaction generally.** The Camp Management System
+   (GDD §20) and the Full Scheduler (§4 UI backlog) both need "view and direct the base while
+   standing somewhere else." Building that view once, here, means those features attach rather
+   than reinvent.
+
+Because it is useful on its own merits, it isn't filler. That distinction is what makes it
+worth building — content that exists only to occupy waiting players is felt as busywork.
+
+#### 7.1.1 The core invariant
+
+> **Ghost mode mutates only ghost state. It can never mutate real state.**
+
+This is the rule the whole feature rests on. Without it, ghost mode becomes remote telekinesis:
+rearrange the camp from across the map, for free, while chopping a tree. Every design question
+below resolves against it.
+
+Consequences:
+
+- Placing a ghost wall is free and instant. Building it is an Active action requiring presence,
+  materials and hours.
+- **A real, built chair cannot be moved from ghost mode.** A player who wants it moved marks it
+  in the plan; that produces a pending *move* blueprint, which someone executes physically as a
+  normal action. The plan expresses intent; bodies do work.
+- The plan layer has no gameplay effect until built. A planned wall blocks nothing, shelters
+  nobody, and stores nothing.
+
+#### 7.1.2 Ghost objects are ordinary world objects
+
+Ghost objects use the **§1.12 Def / Instance / Action model** unchanged. They are Instances with
+a plan-layer membership, not a parallel record type.
+
+- **Home:** a `ghostPlan` sub-collection in the **MapEntityLayer** (§1.11), under the *runtime*
+  sync profile (full Instance synced) — they are placed at arbitrary positions by players, so
+  the authored delta-only profile doesn't apply.
+- **Save/revert:** rides `map_{id}.json` with everything else; revert clears and rehydrates it
+  exactly as other sub-collections do. A Wake Up rolls the plan back along with the world, which
+  is correct — the plan is world state, not UI state.
+- **Sync:** `MapEntitySync`, per-map, under the post-audit subscription discipline. Plan edits
+  are low-frequency and small, so this is cheap.
+- **Networking:** host-authoritative. The client sends a placement/move/delete intent, the host
+  validates and applies, the delta syncs back. Same flow as pickup/drop (§5.4) — no new pattern.
+
+What differs from a real Instance is only **presentation**: ghost objects render solely inside
+ghost mode, using lightweight proxy meshes rather than the built model.
+
+#### 7.1.3 Same-map restriction
+
+Ghost mode reaches **known locations on the dreamer's current map only**.
+
+This is a deliberate limit, and it also happens to make the feature nearly free. On the same
+map, the target location is *already loaded and already simulated* — ghost mode is a camera
+relocation plus a render filter, not a streaming or loading problem. There is no second world
+to spin up.
+
+Cross-map ghosting would mean loading and rendering another map's geometry while the dreamer
+stands on this one. That is a real cost and it collides with the deliberate isolation in GDD
+§20 (no cross-map storage access, no cross-map task assignment, no cross-map signalling). Do not
+extend it without revisiting that design first.
+
+#### 7.1.4 Simulation is untouched
+
+Ghost mode changes **what one client renders**. It changes nothing about what the host
+simulates. Entities, weather, animals, needs, and the world clock all continue exactly as they
+would. There is no fidelity gradient here and no second simulation context.
+
+Rendering constraints inside ghost mode, as performance and clarity measures:
+
+- Terrain, built structures, and the plan layer render. Entities (dreamers, NPCs, animals,
+  ground items) do not.
+- Weather and atmospheric effects are suppressed; a flat neutral lighting state is used so the
+  plan reads clearly at any hour.
+- View distance is clamped to a configurable planning radius around the target location.
+
+The suppression is visual only. A blizzard raging over the base while a player drafts in calm
+grey light is correct behaviour, not a bug — though it argues for a small weather/time readout
+in the ghost HUD so the player isn't misled about conditions.
+
+#### 7.1.5 The body stays in the world
+
+Entering ghost mode does **not** protect the dreamer. The body remains where it was —
+animating at the tree if committed to an active action, standing exposed if not — fully
+simulated, damageable, and interruptible.
+
+**Forced snap-out** returns the player to their body immediately on any event affecting it:
+
+| Trigger | Source |
+|---|---|
+| Hostile enters detection range | Cluster 3 threat detection |
+| Combat begins, or the dreamer takes damage | Cluster 3 |
+| Weather interrupt (blizzard onset) | Cluster 5 |
+| A need/debuff guard trips | §4.5 stage 11 |
+| The dreamer's active action completes or is interrupted | §5.5.11 |
+| Partner emergency signal (horn) | GDD §20 |
+
+These reuse the existing interrupt channel (§4.5 / 0.1.4c) — snap-out is an additional
+subscriber, not new machinery. This is **mandatory, not polish**: a player mauled while
+rearranging furniture will read it as the game cheating, and rightly.
+
+Whether ghost mode can be *entered* while a threat is already present should mirror skip: if
+skip is blocked, ghosting is blocked.
+
+#### 7.1.6 Availability and cost
+
+- **Available at any time**, not only while committed to an action. Simpler, and it means
+  players adopt it as the standard base-planning interface rather than a wait-filler — which is
+  the better outcome.
+- **Zero time cost, zero energy cost, no `actionClass`.** It is not an action; it does not enter
+  a slot, draw from the pool, or touch the trivial bracket. Charging for planning would
+  discourage exactly the behaviour the feature exists to enable.
+- Entering and leaving are instant.
+
+#### 7.1.7 Concurrency — first interaction wins
+
+Both dreamers may ghost to the same base and edit the same plan simultaneously. Conflict
+resolution reuses the **single-occupancy reservation** pattern from §5.6.4 (`coop = false`),
+applied to ghost objects:
+
+- Interacting with a ghost object (grab / move / rotate / delete) **reserves it** on the host.
+- The reservation is held by whichever intent the **host validates first**. Ordering is the
+  host's, so latency resolves deterministically.
+- The losing client receives an **"already in use"** rejection and its optimistic local move
+  reverts.
+- The reservation releases on drop, on cancel, on snap-out, and on disconnect.
+
+**Open — reservation granularity.** If ghost editing supports grouping or snapping (a wall and
+the floor beneath it; a furniture set), a per-object reservation is insufficient: two players
+can each hold a legal reservation and still produce a conflicting result. The reservation likely
+needs to cover the affected set. Resolve once the ghost editing verbs are defined; not a
+blocker for the single-object case.
+
+#### 7.1.8 Partner visibility
+
+A dreamer in ghost mode is **idle for coordination purposes** — not engaged in labor, therefore
+available to agree to a skip, and their skipped hours convert to the trivial bracket (§5.5.5) as
+normal idle time.
+
+The partner status HUD element required by §5.5.12 should show a **ghosting** state distinctly
+from **idle**, so a player can tell "they're drafting, they'll answer in a second" from "they're
+standing around." Small addition to an element already required.
+
+#### 7.1.9 Dependency and phasing gap
+
+Ghost mode needs something to plan, which means it needs the **blueprint / placement system —
+Cluster 4**. It cannot ship meaningfully before that.
+
+**This leaves a real gap.** The §5.5 revision lands well before Cluster 4, and its 1× waiting
+case has no productive filler in the interval. Options, to decide rather than discover:
+
+- **Accept the gap.** Waiting players get camera, inventory, map, queueing and cancel — the
+  §5.5.3 non-modal guarantee — and no drafting. Probably survivable; the filler is a comfort,
+  not a correctness requirement.
+- **Bring the trivial bracket forward** as the interim answer. Sharpening, mending and tidying
+  during a partner's commitment already give the idle player something worth doing.
+- **Ship a camera-only precursor** — free-look ghosting with no editing. Cheap (it is a camera
+  move plus a render filter), and it validates the snap-out interrupt wiring before the plan
+  layer exists. Low value on its own, but it de-risks the interrupt path.
+
+Preference: accept the gap, ensure the trivial bracket lands with §5.5, and build ghost mode
+whole in Cluster 4.
+
+#### 7.1.10 What attaches later
+
+| Feature | Attachment |
+|---|---|
+| **Camp Management System** (GDD §20) | Ghost view of the base is exactly its interface: assign NPC tasks, supply provisions, check needs, all while elsewhere on the map. Same-map restriction already matches its "NPCs physically present at camp" rule. |
+| **Full Scheduler** (§4 UI backlog) | Plans daily routines against a base the player can see. Ghost view is its natural frame. |
+| **Structure decay / repair** (GDD §14) | Inspecting decay state and drafting repairs is planning, not labor — belongs here. |
+| **Migration planning** (GDD §19) | Reviewing what a base holds before committing to leave it. Cross-map version needed first; see §7.1.3. |
+
+#### 7.1.11 Open decisions
+
+1. **Reservation granularity** for grouped/snapped ghost objects (§7.1.7).
+2. **Are planned objects visible outside ghost mode?** A faint in-world overlay of the plan
+   while physically at the base is useful for building, but risks clutter. Likely a toggle.
+3. **Does the plan layer have a commit step?** i.e. does a ghost wall become a buildable
+   blueprint automatically, or does a player explicitly promote plan → blueprint (at which point
+   material requirements are computed and reserved)? An explicit step keeps drafting free of
+   consequence, which suits the drafting-table framing.
+4. **Plan versioning** — can players keep alternative layouts, or is there one live plan per
+   base? One plan is simpler and probably sufficient.
+5. **Can NPCs be directed to build from the plan without a dreamer present at the site?** This
+   is really a Cluster 7 question, but the answer shapes whether the plan is a shared work queue
+   or just a drawing.
+6. **Ghost HUD readout** — how much real-world information leaks in (clock, weather, partner
+   status) given the visual suppression in §7.1.4.

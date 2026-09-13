@@ -71,6 +71,45 @@ namespace Game.Networking
         public bool          allowsOverdraft   => GetAspect<ConsumableAspect>()?.allowsOverdraft ?? false;
         public ActionPayout  payoutShape       => GetAspect<ConsumableAspect>()?.payoutShape     ?? default;
         public bool          interruptsSkip    => GetAspect<ConsumableAspect>()?.interruptsSkip  ?? false;
+        // §5.5.1 class of CONSUMING this item (0.2.11a1). Named apart from ItemAction.actionClass,
+        // which is the class of a world/inventory verb performed ON it.
+        //
+        // Eating and drinking are Trivial by NATURE, not by authoring: they are the canonical
+        // §5.5.1 Trivial cases, and a Def that missed the reclassification pass would silently make
+        // a meal a clock-advancing, slot-occupying Active action. That failure is invisible until a
+        // playtest, so the class is derived from consumeEffect rather than trusted to the field.
+        // The authored field still governs every other consumable kind (the SaveConsumable ritual,
+        // and whatever ConsumeEffect is added next).
+        public ActionClass   consumeActionClass
+        {
+            get
+            {
+                var c = GetAspect<ConsumableAspect>();
+                if (c == null) return ActionClass.Active;
+                return c.consumeEffect == ConsumeEffect.Food || c.consumeEffect == ConsumeEffect.Drink
+                    ? ActionClass.Trivial
+                    : c.actionClass;
+            }
+        }
+
+        /// <summary>True when consuming this item may never be blocked or deferred — food and drink
+        /// always execute (see <see cref="isAlwaysInstantConsumable"/>), plus anything authored with
+        /// the critical-bypass flag.</summary>
+        public bool          consumeAllowsCriticalBypass => GetAspect<ConsumableAspect>()?.allowsCriticalBypass ?? false;
+
+        /// <summary>
+        /// Eating and drinking execute instantly, always — regardless of the trivial bracket. They
+        /// are never deferred to the Active fallback (0.2.11d6) and never occupy the single action
+        /// slot, so they can neither block other work nor be blocked by it.
+        /// </summary>
+        public bool          isAlwaysInstantConsumable
+        {
+            get
+            {
+                var c = GetAspect<ConsumableAspect>();
+                return c != null && (c.consumeEffect == ConsumeEffect.Food || c.consumeEffect == ConsumeEffect.Drink);
+            }
+        }
 
         // Perishable aspect
         public bool          perishable        => HasAspect<PerishableAspect>();

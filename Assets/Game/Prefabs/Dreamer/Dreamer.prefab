@@ -53,7 +53,7 @@ GameObject:
   - component: {fileID: 8625896339938221934}
   - component: {fileID: 795966060113426881}
   - component: {fileID: 5153104204707876873}
-  m_Layer: 0
+  m_Layer: 6
   m_Name: Dreamer
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -218,6 +218,7 @@ MonoBehaviour:
   ShowTopMostFoldoutHeaderGroup: 1
   _syncIntervalSeconds: 1
   _timePoolMax: 1440
+  _showPartnerStatus: 1
 --- !u!114 &1202127598235534360
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -282,6 +283,12 @@ MonoBehaviour:
   _precisionRadius: 0.02
   _precisionKey: 306
   _actionMenuKey: 101
+  _holdToCommitSeconds: 0.35
+  _commitOptionsMinutes:
+  - 15
+  - 30
+  - 60
+  - 120
   _showProbeDebug: 1
 --- !u!114 &8625896339938221934
 MonoBehaviour:
@@ -460,7 +467,7 @@ GameObject:
   - component: {fileID: 2294998021671640588}
   - component: {fileID: 5358824937394284364}
   - component: {fileID: 3651608073258672213}
-  m_Layer: 0
+  m_Layer: 6
   m_Name: Mesh
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -567,7 +574,7 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 5873762733670710218}
-  m_Layer: 0
+  m_Layer: 6
   m_Name: DreamerModel
   m_TagString: Untagged
   m_Icon: {fileID: 0}
