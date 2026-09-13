@@ -2860,9 +2860,11 @@ machine-local configuration, so it falls to you.
   `%LOCALAPPDATA%\Microsoft\WinGet\Links\restic.exe`. A **new** terminal is needed before
   `restic` resolves on PATH.
 
-- [ ] **Set the repository password, then initialise the primary archive repo at
-  `G:\CoremendersBackup`.** Run these yourself — the password must not pass through a
-  transcript or land in the project folder. Three lines in a fresh PowerShell:
+- [x] **Set the repository password, then initialise the primary archive repo at
+  `G:\CoremendersBackup`.** Done — repo `b6de4973b5` created 2026-09-13. Password file at
+  `C:\Users\User\.config\restic\coremenders.txt`; `RESTIC_REPOSITORY` and
+  `RESTIC_PASSWORD_FILE` are persistent **User** environment variables, so a new terminal
+  picks them up and `restic` commands need no flags. Kept below for the next machine:
   ```powershell
   # 1. Create a strong passphrase, store it in your password manager FIRST, then:
   $pw = Read-Host "restic repo password" -AsSecureString
@@ -2887,7 +2889,10 @@ machine-local configuration, so it falls to you.
     125 Island01 terrain tiles (~68 MB) currently exist only in the working folder** —
     not in git, not in any archive.
 
-- [ ] **Take the first snapshot** once the repo is initialised.
+- [x] **First snapshot — `68561dd6`, tag `terrain-island01`, 2026-09-13.**
+  266.8 MiB processed, 50.7 MiB stored after dedup; 1602 files. Verified to contain all
+  **124 Island01 terrain tiles**, the gitignored `Assets/Imports/` model, and `.git/`;
+  `Library/` excluded.
   ```powershell
   restic backup "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost" `
     --exclude Library --exclude Temp --exclude Obj `
@@ -2895,9 +2900,9 @@ machine-local configuration, so it falls to you.
     --tag terrain-island01
   restic snapshots
   ```
-  - Record the snapshot ID here once it completes.
   - *Why:* `.git/` is deliberately **included** — that is what makes a snapshot a
-    self-contained project rather than half of one.
+    self-contained project rather than half of one. This snapshot is the only copy of
+    the terrain tiles and the imported model that exists outside the working folder.
 
 - [ ] **Initialise the second, off-site archive destination.** One local, one remote.
   - *Why:* a single archive on the same machine as the project is not a backup.
