@@ -107,6 +107,21 @@ desktop.ini
 *.avi*
 *.webm*
 
+# Terrain data. Each TerrainData .asset is a ~557 KB whole-file
+# rewrite on every sculpt, and the Island01 tile set is ~68 MB
+# across 125 tiles — heavy binary churn by any measure, so it
+# goes to the archive like the rest. The Terrain GameObjects in
+# Action.unity stay tracked and reference these by GUID: a clone
+# needs an archive restore before the scene opens complete.
+Assets/Game/Terrain/
+Assets/Game/Terrain.meta
+
+# Raw model/import drop folder. Its contents are already ignored
+# by the *.fbx* rule above; the folder meta goes with them so a
+# clone does not carry a meta for a folder that is not there.
+Assets/Imports/
+Assets/Imports.meta
+
 # ─────────────────────────────────────────────────────────────
 # Exceptions: small, stable assets worth tracking.
 # Add entries here with a comment explaining why. Do not loosen
