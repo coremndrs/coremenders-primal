@@ -164,6 +164,22 @@ namespace Game.Networking
         public float ActiveDuration;
         public byte  QueueCount;
         public float TimePool;
+        /// <summary>Index of ActiveDefId's entry in the real slot queue (0.2.11a3). The queue now
+        /// also carries object-bound labor and crafts, which this payload skips, so the consumable
+        /// the HUD is showing is not necessarily at index 0 — the cancel button needs the real one.</summary>
+        public byte  ActiveQueueIndex;
+        /// <summary>Remaining trivial-bracket minutes (0.2.11d1/d7). Kept beside TimePool but a
+        /// separate field: the HUD must show them apart, since bracket minutes cannot be spent on
+        /// work and reading them as pool would badly mislead the player's planning.</summary>
+        public float TrivialBracket;
+        /// <summary>Committed minutes and commit clock of the active commitment (0.2.11c8), so the
+        /// client can compute elapsed/remaining exactly rather than extrapolating.</summary>
+        public float CommittedMinutes;
+        public float CommitStart;
+        /// <summary>Minutes still owed on whatever occupies the slot, however that work is measured
+        /// — a committed window for object-bound labor, a duration for a needs task or consumable.
+        /// This is what the wait-or-skip affordance offers to skip (0.2.11c5).</summary>
+        public float SlotRemaining;
 
         public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
         {
@@ -172,6 +188,11 @@ namespace Game.Networking
             serializer.SerializeValue(ref ActiveDuration);
             serializer.SerializeValue(ref QueueCount);
             serializer.SerializeValue(ref TimePool);
+            serializer.SerializeValue(ref ActiveQueueIndex);
+            serializer.SerializeValue(ref TrivialBracket);
+            serializer.SerializeValue(ref CommittedMinutes);
+            serializer.SerializeValue(ref CommitStart);
+            serializer.SerializeValue(ref SlotRemaining);
         }
     }
 
@@ -392,18 +413,57 @@ namespace Game.Networking
             var dreamer = RuntimeDataManager.Instance?.GetDreamer(_adapter.Slot);
             if (dreamer == null) return default;
 
+            // 0.2.11a3: the slot queue is now shared with object-bound labor and crafts, which have
+            // their own HUD payloads (_worldTasks / _craft). Report only the consumable-style
+            // entries here, so the "Actions" list neither double-counts them nor offers a ✕ that
+            // the consumable cancel path would refuse.
             var p = new ActionQueuePayload
             {
-                QueueCount = (byte)Math.Min(dreamer.actionQueue?.Count ?? 0, 255),
-                TimePool   = dreamer.timePool,
+                TimePool       = dreamer.timePool,
+                TrivialBracket = dreamer.trivialBracket,
             };
-            if (dreamer.actionQueue?.Count > 0)
+
+            // The active slot entry — including object-bound work and needs tasks, which the
+            // consumable scan below skips but which the c8 commitment HUD and the c5 wait-or-skip
+            // affordance both need.
+            float nowM   = RuntimeDataManager.Instance?.WorldState?.clock?.totalInGameMinutes ?? 0f;
+            var   active = dreamer.ActiveAction();
+            if (active != null && active.started)
             {
-                var a            = dreamer.actionQueue[0];
-                p.ActiveDefId    = a.itemDefId;
-                p.ActiveStart    = a.startTime;
-                p.ActiveDuration = a.duration;
+                if (active.committedMinutes > 0f)
+                {
+                    p.CommittedMinutes = active.committedMinutes;
+                    p.CommitStart      = active.commitStart;
+                    p.SlotRemaining    = active.CommittedRemainingAt(nowM);
+                }
+                else
+                {
+                    p.SlotRemaining = Mathf.Max(0f, active.duration - active.ElapsedAt(nowM));
+                }
             }
+
+            int count = 0, activeIndex = -1;
+            var queue = dreamer.actionQueue;
+            for (int i = 0; queue != null && i < queue.Count; i++)
+            {
+                // Skip object-bound work (externallyResolved) and needs tasks: both have their own
+                // HUD source (_worldTasks / DreamerTaskSync), and a needs task has no itemDefId, so
+                // listing it here would render a "def#0" row with a cancel button that does nothing.
+                if (queue[i] == null || queue[i].externallyResolved || queue[i].kind == ActionSlotKind.Task) continue;
+                count++;
+                if (activeIndex >= 0) continue;
+
+                activeIndex      = i;
+                p.ActiveDefId    = queue[i].itemDefId;
+                // Report a window only once the entry is actually running — an entry still waiting
+                // behind object-bound work has no start time, and a stale one would draw a bar that
+                // is already "finished".
+                p.ActiveStart    = queue[i].started ? queue[i].startTime : 0f;
+                p.ActiveDuration = queue[i].started ? queue[i].duration  : 0f;
+            }
+
+            p.QueueCount       = (byte)Math.Min(count, 255);
+            p.ActiveQueueIndex = (byte)Math.Max(0, activeIndex);
             return p;
         }
 
@@ -418,7 +478,9 @@ namespace Game.Networking
             CommitActionPayload(BuildActionPayload());
         }
 
-        public float TimePool => _actionQueue.Value.TimePool;
+        public float TimePool       => _actionQueue.Value.TimePool;
+        /// <summary>Remaining trivial-bracket minutes (0.2.11d1). Read by the needs HUD.</summary>
+        public float TrivialBracket => _actionQueue.Value.TrivialBracket;
 
         // ── Craft status NV (0.2.10a) ─────────────────────────────────────────────
 
@@ -631,6 +693,9 @@ namespace Game.Networking
                     RemoveStorageModifier(item, container, now, defs);
 
             var pos = RuntimeDataManager.Instance.GetDreamerPosition(_adapter.Slot) ?? Vector3.zero;
+            pos = MapEntitySync.Instance != null
+                ? MapEntitySync.Instance.ResolveGroundPosition(pos, container.defId)
+                : pos;
             container.id = layer.nextInstanceId++;
             container.location = new InstanceLocation { kind = LocationKind.InWorld, position = pos.ToFloat3() };
             layer.worldObjects.items.Add(container);
@@ -692,6 +757,9 @@ namespace Game.Networking
 
             RemoveStorageModifier(inst, container, now, defs);
             container.contents.items.RemoveAt(itemIndex);
+            pos = MapEntitySync.Instance != null
+                ? MapEntitySync.Instance.ResolveGroundPosition(pos, inst.defId)
+                : pos;
             inst.id = layer.nextInstanceId++;
             inst.location = new InstanceLocation { kind = LocationKind.InWorld, position = pos.ToFloat3() };
             // Rebuild world accrual: a dropped world-action object (e.g. Large Tree Log) lost its
@@ -758,16 +826,60 @@ namespace Game.Networking
                 duration = def.timeCost; hungerTotal = def.hungerRestore; thirstTotal = def.thirstRestore;
             }
 
-            if (duration <= 0f)
+            // ── Trivial execution against the bracket (§5.5.5, 0.2.11d2/d5/d6) ───────
+            //
+            // A Trivial consumable resolves NOW: ~1s of wall clock, no world-clock advance at all,
+            // and its duration debited from the trivial bracket instead of the day pool. That is
+            // what stops a handful of maintenance actions costing six real minutes each.
+            //
+            // Three outcomes, in order:
+            //   bracket covers it            → instant, debit the bracket (d2)
+            //   bracket short, but critical  → instant anyway, bracket floors at 0 (d5)
+            //   bracket short, not critical  → fall through and run as a normal Active action at
+            //                                  full duration (d6). Forgiving beats hard-blocking,
+            //                                  and it keeps the bypass list short.
+            bool instant       = duration <= 0f;
+            bool trivialBudget = false;
+            if (!instant && def.consumeActionClass == ActionClass.Trivial)
             {
+                // Eating and drinking ALWAYS execute instantly. They are not gated on the bracket
+                // and never fall back to the Active path: a meal must never occupy the single action
+                // slot, because a dreamer who cannot eat without abandoning their work is a dreamer
+                // the presence rule has turned against the player. The bracket is still debited so
+                // the accounting stays honest, but it floors at 0 rather than blocking.
+                if (def.isAlwaysInstantConsumable)                { instant = true; trivialBudget = true; }
+                else if (dreamer.trivialBracket >= duration)      { instant = true; trivialBudget = true; }
+                else if (def.consumeAllowsCriticalBypass)
+                {
+                    instant = true; trivialBudget = true;
+                    Debug.Log($"[DreamerInventorySync] Slot {_adapter.Slot}: critical bypass — consuming " +
+                              $"def={inst.defId} on a {dreamer.trivialBracket:F0} min bracket (d5).");
+                }
+                else
+                {
+                    Debug.Log($"[DreamerInventorySync] Slot {_adapter.Slot}: bracket too short for " +
+                              $"def={inst.defId} ({dreamer.trivialBracket:F0} < {duration:F0}) — running it " +
+                              $"as an Active action instead (d6).");
+                }
+            }
+
+            if (instant)
+            {
+                // Blocked only by the single-slot rule, and only when it costs bracket: a genuinely
+                // zero-duration consumable never occupied a slot and must stay usable mid-work.
+                if (trivialBudget)
+                    dreamer.trivialBracket = Mathf.Max(0f, dreamer.trivialBracket - duration);
+
                 inst.quantity -= 1f;
                 if (inst.quantity <= 0f) container.contents.items.RemoveAt(itemIndex);
                 switch (def.consumeEffect)
                 {
                     case ConsumeEffect.Food:
                     case ConsumeEffect.Drink:
-                        dreamer.needs.hunger = Mathf.Min(100f, dreamer.needs.hunger + def.hungerRestore);
-                        dreamer.needs.thirst = Mathf.Min(100f, dreamer.needs.thirst + def.thirstRestore);
+                        // Trivial payout is immediate and whole — there is no window to spread a
+                        // nourishment buff over, because the world clock does not move.
+                        dreamer.needs.hunger = Mathf.Min(100f, dreamer.needs.hunger + hungerTotal);
+                        dreamer.needs.thirst = Mathf.Min(100f, dreamer.needs.thirst + thirstTotal);
                         GetComponent<DreamerNeedsSync>()?.ForcePush();
                         break;
                     case ConsumeEffect.SaveConsumable:
@@ -808,6 +920,12 @@ namespace Game.Networking
                 endEffect             = endEffect,
                 interruptsSkip        = def.interruptsSkip,
                 started               = false,
+                // 0.2.11a1: the class is baked in at commit so a def re-authored mid-action does not
+                // change it in flight. Consumables keep FIFO queue-ahead on the surviving slot —
+                // that is what makes standing at a tree for the 1× wait tolerable (§5.5.16).
+                kind                  = ActionSlotKind.Consumable,
+                taskType              = TaskType.Eating,
+                actionClass           = def.consumeActionClass,
             });
 
             ForcePush(); ForcePushAction();
@@ -825,6 +943,17 @@ namespace Game.Networking
 
             var   action = dreamer.actionQueue[queueIndex];
             float now    = RuntimeDataManager.Instance?.WorldState?.clock?.totalInGameMinutes ?? 0f;
+
+            // 0.2.11a3: the queue now also holds object-bound labor and crafts. Those carry reserved
+            // materials, open accrual segments and per-contributor refunds — none of which this
+            // consumable refund path knows about — so they must be stopped through their own action
+            // (StopWorldActionServerRpc / StopStationCraftServerRpc / CancelCraftServerRpc).
+            if (action.externallyResolved)
+            {
+                Debug.LogWarning($"[DreamerInventorySync] CancelAction ignored: slot entry {queueIndex} is " +
+                                 $"{action.kind}; stop it through its own action.");
+                return;
+            }
 
             if (queueIndex == 0 && action.started)
             {
@@ -869,7 +998,7 @@ namespace Game.Networking
                 Debug.Log($"[DreamerInventorySync] Cancelled queued action def={action.itemDefId} (full refund) for dreamer {_adapter.Slot}.");
             }
 
-            dreamer.actionQueue.RemoveAt(queueIndex);
+            dreamer.RemoveAt(queueIndex);
             ForcePush(); ForcePushAction();
             GetComponent<DreamerNeedsSync>()?.ForcePush();
         }
@@ -986,10 +1115,13 @@ namespace Game.Networking
                 Debug.LogWarning($"[DreamerInventorySync] Craft rejected: no tool of category {recipe.requiredToolCategoryId}.");
                 return;
             }
-            // Busy check: one self-contained task at a time (§5.5.2 Task channel single active slot).
-            if (dreamer.craft != null || dreamer.task.type != TaskType.Idle)
+            // Busy check: ONE active action at a time (§5.5, 0.2.11a3). The slot now covers every
+            // kind of committed work — consumable, needs task, world labor, station craft — so this
+            // one test replaces the old "task channel is Idle" check and closes the hole where a
+            // dreamer could hand-craft while felling a tree on the other channel.
+            if (dreamer.craft != null || dreamer.IsBusy())
             {
-                Debug.LogWarning($"[DreamerInventorySync] Craft rejected: dreamer {_adapter.Slot} is busy ({dreamer.task.type}).");
+                Debug.LogWarning($"[DreamerInventorySync] Craft rejected: dreamer {_adapter.Slot} is busy ({dreamer.CurrentTaskType()}).");
                 return;
             }
             // Affordability: crafts do not overdraft (§5.5.1). Hard gate on timePool + materials.
@@ -1024,11 +1156,29 @@ namespace Game.Networking
                 reservedEnergy  = recipe.energyCost,
                 reservedInputs  = reserved,
             };
-            // Mark the Task channel with a "Crafting" label (§5.5.2). Like the Gathering marker this is
-            // a one-tick cosmetic — SimResolver stage 4b clears any durationMinutes=0 task next tick —
-            // so the AUTHORITATIVE "is this dreamer crafting" flag is dreamer.craft (checked above and
-            // in CheckHandCraftCompletion), not this. Real progress is the craft HUD (clock-computed).
-            dreamer.task = new DreamerTask { type = TaskType.Crafting };
+            // Occupy the single action slot for the duration of the craft (0.2.11a3). Unlike the old
+            // one-tick cosmetic task marker, this record is authoritative occupancy: it is what stops
+            // the dreamer starting a second action. It is externallyResolved because completion is
+            // driven by CheckHandCraftCompletion against the craft's own clock window, not by
+            // SimResolver timing out a duration. dreamer.craft remains the craft PAYLOAD.
+            dreamer.actionQueue ??= new List<ActionRecord>();
+            dreamer.actionQueue.Insert(0, new ActionRecord
+            {
+                kind               = ActionSlotKind.HandCraft,
+                taskType           = TaskType.Crafting,
+                actionClass        = recipe.actionClass,
+                recipeId           = recipe.recipeId,
+                duration           = recipe.timeCost,
+                externallyResolved = true,
+                started            = true,
+                startTime          = now,
+                committedMinutes   = recipe.timeCost,
+                commitStart        = now,
+                // Presence anchor (§5.5.3, 0.2.11b3): a hand craft has no object to stand at, so it
+                // binds to the spot where it was committed. Walking off cancels it.
+                presenceAnchored   = true,
+                presenceAnchor     = CurrentPresenceAnchor(),
+            });
 
             ForcePush(); ForcePushCraft();
             GetComponent<DreamerTaskSync>()?.ForcePush();
@@ -1041,7 +1191,11 @@ namespace Game.Networking
         /// instead of refunding materials — is 0.2.10c2; a returns the materials in full.)
         /// </summary>
         [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
-        public void CancelCraftServerRpc()
+        public void CancelCraftServerRpc() => CancelActiveHandCraft();
+
+        /// <summary>Host-side body shared by the player's explicit cancel and the presence-loss
+        /// cancel (0.2.11b3), so the two can never drift apart on refunds.</summary>
+        private void CancelActiveHandCraft()
         {
             var dreamer = RuntimeDataManager.Instance?.GetDreamer(_adapter.Slot);
             var c       = dreamer?.craft;
@@ -1056,7 +1210,7 @@ namespace Game.Networking
             RefundInputs(dreamer, c.reservedInputs, now);
 
             dreamer.craft = null;
-            dreamer.task  = new DreamerTask();
+            ClearHandCraftSlot(dreamer);
 
             ForcePush(); ForcePushCraft();
             GetComponent<DreamerTaskSync>()?.ForcePush();
@@ -1082,7 +1236,7 @@ namespace Game.Networking
             var outputs = CraftResolver.BuildOutputs(recipe, c, now);
 
             dreamer.craft = null;
-            dreamer.task  = new DreamerTask();
+            ClearHandCraftSlot(dreamer);
 
             var pos = RuntimeDataManager.Instance?.GetDreamerPosition(_adapter.Slot) ?? Vector3.zero;
             foreach (var outInst in outputs)
@@ -1092,6 +1246,42 @@ namespace Game.Networking
             ForcePush(); ForcePushCraft();
             GetComponent<DreamerTaskSync>()?.ForcePush();
             Debug.Log($"[DreamerInventorySync] Slot {_adapter.Slot} completed hand craft '{recipe?.displayName}' → {outputs.Count} stack(s).");
+        }
+
+        /// <summary>Where this dreamer is standing right now, as the Simulation-side Float3 an
+        /// ActionRecord's presence anchor holds (0.2.11b3).</summary>
+        private Float3 CurrentPresenceAnchor()
+        {
+            var p = RuntimeDataManager.Instance?.GetDreamerPosition(_adapter.Slot) ?? Vector3.zero;
+            return new Float3(p.x, p.y, p.z);
+        }
+
+        /// <summary>
+        /// Host: the crafter walked away from their hand craft (§5.5.3, 0.2.11b3). Same refund and
+        /// material-return path as an explicit cancel — presence loss is not a penalty, it just
+        /// stops the work (§5.5.4). Called by MapEntitySync's presence monitor, not by an RPC.
+        /// </summary>
+        public void CancelHandCraftForPresence()
+        {
+            if (!IsServer) return;
+            CancelActiveHandCraft();
+        }
+
+        /// <summary>
+        /// Vacates the single action slot when it holds this dreamer's hand craft (0.2.11a3).
+        /// Matched on kind rather than blindly clearing index 0: by the time a craft completes the
+        /// slot could legitimately hold something else if a future path ever displaces it, and
+        /// dropping an unrelated record would strand a world-object contributor.
+        /// </summary>
+        private static void ClearHandCraftSlot(Game.Simulation.DreamerRecord dreamer)
+        {
+            if (dreamer?.actionQueue == null) return;
+            for (int i = 0; i < dreamer.actionQueue.Count; i++)
+                if (dreamer.actionQueue[i]?.kind == ActionSlotKind.HandCraft)
+                {
+                    dreamer.RemoveAt(i);
+                    return;
+                }
         }
 
         // ── Craft material + tool helpers (list-iterated, TDD §5.7.0 / 0.2.10a2) ──
@@ -1376,6 +1566,37 @@ namespace Game.Networking
             GUI.Label(new Rect(x, y, 240, 20), "── Actions ──");
             y += 22f;
 
+            // Commitment bar (§5.5.3, 0.2.11c8): committed / elapsed / remaining, computed on the
+            // client from the synced record plus the clock — no extrapolation, so it is exact on
+            // both peers and after a revert. Drawn above the action rows because "how long am I
+            // locked in for" is the question a committed player is actually asking.
+            if (aq.CommittedMinutes > 0f)
+            {
+                float nowM      = GetCurrentClockTime();
+                float elapsed   = Mathf.Max(0f, nowM - aq.CommitStart);
+                float remaining = Mathf.Max(0f, aq.CommittedMinutes - elapsed);
+                float pct       = Mathf.Clamp01(elapsed / aq.CommittedMinutes) * 100f;
+
+                var savedC = GUI.color;
+                GUI.color  = new Color(0.75f, 0.9f, 1f);
+                GUI.Label(new Rect(x, y, 280, 18),
+                    $"  ⏱ committed {aq.CommittedMinutes:F0}m — {elapsed:F0}m in, {remaining:F0}m left ({pct:F0}%)");
+                GUI.color = savedC;
+                y += 20f;
+            }
+
+            // Wait-or-skip (c5) — offered for anything with time still owed, committed labor and
+            // needs tasks alike. Skipping an eight-hour sleep is the commonest case of all, so
+            // gating this on a commitment window would miss the point.
+            if (aq.SlotRemaining > 0f)
+            {
+                var skipMgr = FindFirstObjectByType<SkipManager>();
+                if (skipMgr != null && !skipMgr.IsSkipping && !skipMgr.HasPendingSkipRequest)
+                    if (GUI.Button(new Rect(x + 4f, y, 200f, 20f), $"Skip the remaining {aq.SlotRemaining:F0}m"))
+                        skipMgr.RequestCommitmentSkipServerRpc();
+                y += 24f;
+            }
+
             // Idle only when nothing is running in ANY channel (eating queue, hand craft, world tasks).
             if (aq.QueueCount == 0 && cs.Active == 0 && wt.Count == 0)
             {
@@ -1389,7 +1610,7 @@ namespace Game.Networking
                 string activeName = activeSo != null ? activeSo.displayName : $"def#{aq.ActiveDefId}";
                 GUI.Label(new Rect(x, y, 160, 18), $"  {activeName}");
                 if (GUI.Button(new Rect(x + 163f, y, 18f, 18f), "✕"))
-                    CancelActionServerRpc(0);
+                    CancelActionServerRpc(aq.ActiveQueueIndex);
                 y += 20f;
                 if (aq.QueueCount > 1) { GUI.Label(new Rect(x, y, 200, 18), $"  +{aq.QueueCount - 1} queued"); y += 20f; }
             }
@@ -1511,16 +1732,26 @@ namespace Game.Networking
                             bool canUse = so != null && nestedGroupIdx < 0 &&
                                 (isTool ? cond > 0 : so.consumeEffect != ConsumeEffect.None);
                             GUI.enabled = canUse;
-                            if (GUI.Button(new Rect(x + 153f, y, 32f, 18f), "Use"))
+                            // The verb names the action (§5.5.1): eating and drinking are their own
+                            // Trivial actions, not a generic "use". A single Use button for food,
+                            // water and axes alike hides the one distinction that matters here —
+                            // that two of those are instant and the third is not.
+                            string verb = isTool ? "Use" : so?.consumeEffect switch
+                            {
+                                ConsumeEffect.Food  => "Eat",
+                                ConsumeEffect.Drink => "Drink",
+                                _                   => "Use",
+                            };
+                            if (GUI.Button(new Rect(x + 153f, y, 40f, 18f), verb))
                             {
                                 if (isTool) DevUseToolServerRpc(slotByte, i);
                                 else        ConsumeItemServerRpc(slotByte, i);
                             }
                             GUI.enabled = qtyInt >= 2 && nestedGroupIdx < 0;
-                            if (GUI.Button(new Rect(x + 188f, y, 38f, 18f), "Split"))
+                            if (GUI.Button(new Rect(x + 196f, y, 38f, 18f), "Split"))
                                 SplitItemServerRpc(slotByte, i);
                             GUI.enabled = true;
-                            if (GUI.Button(new Rect(x + 229f, y, 38f, 18f), "Drop"))
+                            if (GUI.Button(new Rect(x + 237f, y, 38f, 18f), "Drop"))
                                 DropItemServerRpc(slotByte, i);
                             y += 20f;
 

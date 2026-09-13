@@ -144,6 +144,29 @@ namespace Game.Networking
         [Tooltip("Fallback visual for world objects (Def has world actions) with no prefab assigned.")]
         [SerializeField] private GameObject _processablePrefab;
 
+        [Header("Ground snap (host-side placement)")]
+        [Tooltip("Resolve every world placement onto the ground. Without this, a yield spawned from " +
+                 "an object whose base is sunk into the terrain (a tree planted slightly low) appears " +
+                 "underground, and a drop on a slope hangs in the air.")]
+        [SerializeField] private bool _snapToGround = true;
+
+        [Tooltip("Layers treated as ground. Dreamers are skipped regardless.")]
+        [SerializeField] private LayerMask _groundMask = ~0;
+
+        [Tooltip("How far above the placement to start the downward probe — also the depth from " +
+                 "which a placement buried inside the terrain can be lifted back out.")]
+        [SerializeField] private float _probeAbove = 5f;
+
+        [Tooltip("How far below the placement to look for ground before giving up.")]
+        [SerializeField] private float _probeBelow = 100f;
+
+        [Tooltip("Gap left between the object's base and the surface.")]
+        [SerializeField] private float _groundClearance = 0.02f;
+
+        [Tooltip("Rest the object's visual base on the surface (measured from its Def prefab's " +
+                 "renderer bounds) rather than its pivot. Turn off if prefabs are authored pivot-at-base.")]
+        [SerializeField] private bool _alignToPrefabBase = true;
+
         // ── Network Variable (single runtime profile) ────────────────────────────
 
         private readonly NetworkVariable<WorldObjectPayload> _worldObjects = new NetworkVariable<WorldObjectPayload>(
@@ -194,7 +217,6 @@ namespace Game.Networking
             DestroyAllVisuals();
             _currentProcessables.Clear();
             _authoredHidden.Clear();
-            _joinClock.Clear();
             _proportionalDelivered.Clear();
 
             if (Instance == this) Instance = null;
@@ -206,12 +228,188 @@ namespace Game.Networking
         private void Update()
         {
             if (!IsServer) return;
+
+            // Presence runs EVERY frame, not on the sync interval: a dreamer who walks out of range
+            // must stop accruing at the instant they leave, not up to a second later. It is two
+            // distance checks, so the cost is irrelevant next to the correctness.
+            EnforcePresence();
+
             _syncTimer += Time.deltaTime;
             if (_syncTimer < _syncInterval) return;
             _syncTimer = 0f;
 
             CheckActionCompletions();
             PushFromRdm();
+        }
+
+        // ── Presence binding (§5.5.3, 0.2.11b) ───────────────────────────────────
+        //
+        // The rule this build exists for: committed active labor is presence-bound. The dreamer
+        // stands at the work, and the work stops when they leave. Before 0.2.11 a commitment was
+        // fire-and-forget — commit four hours to a tree, walk away, collect the log — which is
+        // architecturally clean and experientially dead.
+        //
+        // Two shapes of presence, because there are two shapes of work:
+        //   • Object-bound (gather / process / station craft): presence = within presenceRange of
+        //     the Instance. Leaving fires the contributor-change event, which closes the accrual
+        //     segment at that timestamp. Progress is retained; walking back does NOT auto-resume,
+        //     it requires a fresh commit (b1).
+        //   • Self-contained (hand craft / rest / sleep): there is no object to measure against, so
+        //     the record carries an anchor stamped where the dreamer committed. Drifting further
+        //     than presenceMoveTolerance from it cancels the action under the §5.5.4 refund rules (b3).
+        //
+        // Commitment expiry (c3) is resolved here too, because it is the same question asked of the
+        // clock instead of the map: the committed window has run out, so contribution ends with the
+        // remainder left on the object.
+
+        private void EnforcePresence()
+        {
+            var world = RuntimeDataManager.Instance?.WorldState;
+            if (world?.dreamers == null || world.clock == null) return;
+
+            var   cfg = GetNeedsConfig();
+            float now = world.clock.totalInGameMinutes;
+
+            foreach (var dreamer in world.dreamers)
+            {
+                var active = dreamer?.ActiveAction();
+                if (active == null || !active.started) continue;
+
+                // Commitment expiry first — an expired commitment ends even if the dreamer never
+                // moved, and settling it here means the presence checks below see a free slot.
+                if (active.IsCommitmentExpiredAt(now))
+                {
+                    Debug.Log($"[MapEntitySync] Slot {dreamer.slot} commitment expired " +
+                              $"({active.committedMinutes:F0} min served) — contribution ends, remainder stays.");
+                    EndPresence(dreamer, active, now);
+                    continue;
+                }
+
+                var pos = RuntimeDataManager.Instance?.GetDreamerPosition(dreamer.slot);
+                if (!pos.HasValue) continue;
+
+                if (active.presenceAnchored)
+                {
+                    // Self-contained: measure against where they committed (b3).
+                    var anchor = new Vector3(active.presenceAnchor.x, active.presenceAnchor.y, active.presenceAnchor.z);
+                    if (HorizontalDistance(pos.Value, anchor) <= cfg.presenceMoveTolerance) continue;
+
+                    Debug.Log($"[MapEntitySync] Slot {dreamer.slot} moved away from {active.taskType} — cancelled (§5.5.4).");
+                    EndPresence(dreamer, active, now);
+                    continue;
+                }
+
+                if (active.instanceId < 0) continue; // nothing to measure against
+
+                var obj = ResolveWorldObject(active.instanceId);
+                if (obj == null)
+                {
+                    // The object is gone (depleted by the other dreamer, or removed). Nothing left
+                    // to be present at — release the slot rather than stranding it.
+                    EndPresence(dreamer, active, now);
+                    continue;
+                }
+
+                var objPos = ResolvePosition(obj);
+                if (HorizontalDistance(pos.Value, objPos) <= cfg.presenceRange) continue;
+
+                Debug.Log($"[MapEntitySync] Slot {dreamer.slot} left the work at instance {active.instanceId} " +
+                          $"— contribution ends, progress retained (b1).");
+                EndPresence(dreamer, active, now);
+            }
+        }
+
+        /// <summary>
+        /// Horizontal separation only. A dreamer standing on a log or on a slope above a node is
+        /// still present at it; billing vertical offset as distance would drop them for jumping.
+        /// </summary>
+        private static float HorizontalDistance(Vector3 a, Vector3 b)
+        {
+            a.y = b.y;
+            return Vector3.Distance(a, b);
+        }
+
+        /// <summary>
+        /// Ends one dreamer's presence on their active action, routing to the stop path that owns
+        /// the refund for that kind. Every path retains progress — presence loss is never a penalty,
+        /// it just stops the clock on the contribution (§5.5.4).
+        /// </summary>
+        private void EndPresence(Game.Simulation.DreamerRecord dreamer, ActionRecord active, float now)
+        {
+            switch (active.kind)
+            {
+                case ActionSlotKind.WorldAction:
+                    StopContributor(active.instanceId, active.actionIndex, dreamer.slot);
+                    break;
+                case ActionSlotKind.StationCraft:
+                    StopStationCraft(active.instanceId, dreamer.slot);
+                    break;
+                case ActionSlotKind.HandCraft:
+                    DreamerInventorySync.GetForSlot(dreamer.slot)?.CancelHandCraftForPresence();
+                    break;
+                case ActionSlotKind.Task:
+                    EndNeedsTaskForPresence(dreamer, active, now);
+                    break;
+                default:
+                    dreamer.RemoveAt(0);
+                    break;
+            }
+
+            // Belt and braces: if a stop path declined to act (a mismatched instance, a craft already
+            // gone) the slot would stay occupied and this would fire again every frame, spamming the
+            // log. Clear it directly in that case.
+            var still = dreamer.ActiveAction();
+            if (still == active) dreamer.RemoveAt(0);
+        }
+
+        /// <summary>
+        /// Ends a movement-cancelled sleep or rest. A cut-short sleep goes through the same wake
+        /// resolver as a skip-interrupted one (0.1.6), so its partial protection buff and checkpoint
+        /// are banked identically — otherwise walking out of bed would silently void the sleep.
+        /// </summary>
+        private static void EndNeedsTaskForPresence(Game.Simulation.DreamerRecord dreamer, ActionRecord active, float now)
+        {
+            float slept = active.ElapsedAt(now);
+            dreamer.RemoveAt(0);
+
+            if (active.taskType != TaskType.Sleeping) return;
+            GameFlowManager.Instance?.HandleSleepWake(new List<SleepEndedResult>
+            {
+                new SleepEndedResult
+                {
+                    DreamerSlot  = dreamer.slot,
+                    SleptMinutes = slept,
+                    WasCutShort  = true,
+                },
+            });
+        }
+
+        /// <summary>
+        /// Host: release every dreamer's presence on object-bound work (§5.5.3, 0.2.11b4). Called
+        /// when a skip stops on an INTERRUPT — combat, damage, a predator — where the fiction is
+        /// that the dreamer's attention broke. Progress is retained on the object at the interrupt's
+        /// timestamp; resuming needs a fresh commit.
+        ///
+        /// Deliberately NOT called for a guard-capped skip: c7 says a guard stop leaves the
+        /// commitment mid-progress to continue at 1×, and dropping it would contradict that.
+        /// </summary>
+        public void ReleaseAllPresenceOnInterrupt()
+        {
+            if (!IsServer) return;
+            var world = RuntimeDataManager.Instance?.WorldState;
+            if (world?.dreamers == null || world.clock == null) return;
+
+            float now = world.clock.totalInGameMinutes;
+            foreach (var dreamer in world.dreamers)
+            {
+                var active = dreamer?.ActiveAction();
+                if (active == null || !active.started) continue;
+                // Sleep is force-woken by SkipManager's own path, which reports it as cut short.
+                if (active.kind == ActionSlotKind.Task && active.taskType == TaskType.Sleeping) continue;
+
+                Debug.Log($"[MapEntitySync] Interrupt released slot {dreamer.slot} from {active.taskType} (b4).");
+                EndPresence(dreamer, active, now);
+            }
         }
 
         // ── Server: build + commit payload ───────────────────────────────────────
@@ -455,48 +653,130 @@ namespace Game.Networking
         // per (instance, action, slot). Co-op: each worker debits the full cost and is refunded their
         // unused share, so each nets the cost of the minutes they personally worked.
 
-        private readonly Dictionary<(int inst, int action, int slot), float> _joinClock =
-            new Dictionary<(int, int, int), float>();
-
         private NeedsConfig _needsConfig;
         private NeedsConfig GetNeedsConfig() =>
             _needsConfig ??= (FindFirstObjectByType<WorldClockDriver>()?.NeedsConfig ?? new NeedsConfig());
 
+        // 0.2.11c3 replaced the in-memory `_joinClock` dictionary with `ActionRecord.commitStart` /
+        // `committedMinutes` on the dreamer's slot entry. The dictionary was never persisted, so
+        // after a revert every join clock was lost and the next refund computed against a missing
+        // key — silently refunding nothing. The slot record is saved, so refunds are now revert-exact.
+
         /// <summary>
-        /// Debits the action's COSTS up front (timeRequired → timePool, plus negative-amount effect
-        /// totals). Reward effects (positive amount) are NOT granted here — they are delivered by
+        /// Debits the COSTS of a commitment up front: <paramref name="committed"/> minutes from the
+        /// day pool, plus the negative-amount effect totals scaled to the committed share of the
+        /// action. Reward effects (positive amount) are NOT granted here — they are delivered by
         /// yieldModel (atomic = on completion, proportional = over the work).
+        ///
+        /// Scaling the effects matters: committing 15 minutes of a 60-minute fell must cost a
+        /// quarter of the energy, not all of it, or a partial commit would be strictly punished.
         /// </summary>
-        private void DebitActionCost(int slot, ItemAction ia, float now)
+        private void DebitCommitmentCost(int slot, ItemAction ia, float committed)
         {
             var dreamer = RuntimeDataManager.Instance?.GetDreamer(slot);
-            if (dreamer == null || ia == null) return;
-            var cfg = GetNeedsConfig();
+            if (dreamer == null || ia == null || committed <= 0f) return;
+            var   cfg   = GetNeedsConfig();
+            float share = ia.timeRequired > 0f ? Mathf.Clamp01(committed / ia.timeRequired) : 1f;
 
-            if (ia.timeRequired > 0f)
-                SimResolver.ApplyActionEffect(dreamer, ResourceStat.TimePool, -ia.timeRequired, cfg);
+            SimResolver.ApplyActionEffect(dreamer, ResourceStat.TimePool, -committed, cfg);
             if (ia.effects != null)
                 foreach (var e in ia.effects)
                     if (e.amount < 0f)   // costs only; rewards are delivered on completion / proportionally
-                        SimResolver.ApplyActionEffect(dreamer, e.stat, e.amount, cfg);
+                        SimResolver.ApplyActionEffect(dreamer, e.stat, e.amount * share, cfg);
 
             if (dreamer.timePool < 0f) ApplyExhaustion(dreamer, cfg);
         }
 
-        /// <summary>Refunds the given unused fraction [0,1] of the action's COSTS back to the worker.</summary>
-        private void RefundActionCost(int slot, ItemAction ia, float unusedFraction)
+        /// <summary>Refunds the given unused fraction [0,1] of a commitment's COSTS back to the worker.</summary>
+        private void RefundCommitmentCost(int slot, ItemAction ia, float committed, float unusedFraction)
         {
-            if (ia == null || unusedFraction <= 0f) return;
+            if (ia == null || committed <= 0f || unusedFraction <= 0f) return;
             var dreamer = RuntimeDataManager.Instance?.GetDreamer(slot);
             if (dreamer == null) return;
-            var cfg = GetNeedsConfig();
+            var   cfg   = GetNeedsConfig();
+            float share = ia.timeRequired > 0f ? Mathf.Clamp01(committed / ia.timeRequired) : 1f;
 
-            if (ia.timeRequired > 0f)
-                SimResolver.ApplyActionEffect(dreamer, ResourceStat.TimePool, ia.timeRequired * unusedFraction, cfg);
+            SimResolver.ApplyActionEffect(dreamer, ResourceStat.TimePool, committed * unusedFraction, cfg);
             if (ia.effects != null)
                 foreach (var e in ia.effects)
                     if (e.amount < 0f)   // only costs were debited, so only costs are refunded
-                        SimResolver.ApplyActionEffect(dreamer, e.stat, -e.amount * unusedFraction, cfg);
+                        SimResolver.ApplyActionEffect(dreamer, e.stat, -e.amount * share * unusedFraction, cfg);
+        }
+
+        /// <summary>
+        /// Client-safe estimate of the largest committable duration, for the commit menu (c1).
+        ///
+        /// <b>Why this exists separately from <see cref="MaxCommitFor"/>.</b> That one reads the
+        /// RuntimeDataManager, which is the HOST's authoritative store — on a client every lookup in
+        /// it returns null, so the cap came back 0 and the menu reported "no time to commit" for a
+        /// perfectly choppable tree. This version reads only replicated state: the accrual snapshot
+        /// pushed in the world-object payload, the Def SOs (identical on both peers, rule 6), and
+        /// the caller's own synced day pool.
+        ///
+        /// It is an estimate by design — the labor figure is as fresh as the last payload push, so
+        /// it can lag by up to the sync interval. That is fine because it only decides which buttons
+        /// to draw: the host caps again on receipt, and is the only opinion that counts.
+        /// </summary>
+        public float EstimateMaxCommit(Def def, int instanceId, int actionIndex, float availablePoolMinutes)
+        {
+            var ia = def?.actions != null && actionIndex >= 0 && actionIndex < def.actions.Length
+                        ? def.actions[actionIndex] : null;
+            if (ia == null || ia.timeRequired <= 0f) return 0f;
+
+            // The Def is the source of truth for how much labor the work needs; the payload only
+            // supplies how much has been DONE. Splitting it that way is what makes an authored,
+            // never-touched node work: it has no Instance in the map layer until first interaction
+            // (0.2.9f, delta-only — pristine costs nothing), so it is absent from the payload
+            // entirely. Absent means pristine, not "nothing to commit". Looking the whole answer up
+            // in the payload is why a fresh tree reported "no time to commit" and could not be
+            // chopped from the menu at all.
+            float laborDone = 0f;
+            if (TryGetProcessableActionState(instanceId, actionIndex, out float labor, out bool complete))
+            {
+                if (complete) return 0f;
+                laborDone = labor;
+            }
+
+            float remainingLabor = Mathf.Max(0f, ia.timeRequired - laborDone);
+            return Mathf.Max(0f, Mathf.Min(remainingLabor, availablePoolMinutes));
+        }
+
+        /// <summary>
+        /// The largest commitment this dreamer could make to the given action right now (§5.5.3,
+        /// c1/c2): the lesser of the labor still owed on the work and the minutes left in their day
+        /// pool. Committing more than the work needs would burn pool on nothing; committing more
+        /// than the pool holds is the overdraft this build exists to prevent.
+        ///
+        /// HOST ONLY — it reads the RDM. Clients use <see cref="EstimateMaxCommit"/>.
+        /// </summary>
+        public float MaxCommitFor(int instanceId, int actionIndex, int dreamerSlot)
+        {
+            var obj   = ResolveWorldObject(instanceId);
+            var clock = RuntimeDataManager.Instance?.WorldState?.clock;
+            var d     = RuntimeDataManager.Instance?.GetDreamer(dreamerSlot);
+            if (obj?.location?.accrual == null || clock == null || d == null) return 0f;
+            if (actionIndex < 0 || actionIndex >= obj.location.accrual.Length) return 0f;
+
+            var   def   = DefRegistry.Instance?.Get(obj.defId);
+            var   ia    = def?.actions != null && actionIndex < def.actions.Length ? def.actions[actionIndex] : null;
+            var   state = obj.location.accrual[actionIndex];
+            // A station craft's threshold is recipe-driven (Instance.craft.requiredLabor), not the
+            // def action's fixed timeRequired — otherwise the cap would be wrong for every craft.
+            float total = obj.craft != null && obj.craft.stationActionIndex == actionIndex
+                        ? obj.craft.requiredLabor
+                        : (ia?.timeRequired ?? 0f);
+            if (total <= 0f) return 0f;
+
+            float remainingLabor = Mathf.Max(0f, total - state.LaborAt(clock.totalInGameMinutes));
+            return Mathf.Max(0f, Mathf.Min(remainingLabor, d.timePool));
+        }
+
+        /// <summary>Fraction [0,1] of their commitment the worker did NOT serve, read from their
+        /// (persisted, therefore revert-exact) slot record.</summary>
+        private static float UnusedFractionFor(ActionRecord commitment, float now)
+        {
+            if (commitment == null || commitment.committedMinutes <= 0f) return 0f;
+            return Mathf.Clamp01(1f - (now - commitment.commitStart) / commitment.committedMinutes);
         }
 
         // ── Reward delivery (yieldModel: Atomic = on completion, Proportional = over the work) ─────
@@ -555,13 +835,71 @@ namespace Game.Networking
             _proportionalDelivered[key] = cur;
         }
 
-        /// <summary>Fraction [0,1] of the action the worker did NOT do, from their tracked join clock.</summary>
-        private float UnusedFractionFor(int instanceId, int actionIndex, int slot, ItemAction ia, float now)
+        /// <summary>
+        /// Finishes the work instead of abandoning it, when the accrued labor already meets the
+        /// threshold. Returns true if it completed — in which case the caller must NOT go on to stop
+        /// the contributor, because completion has already settled and cleared every one of them.
+        ///
+        /// <b>Why every exit path has to ask this first (0.2.11 fix).</b> Completion is detected in
+        /// CheckActionCompletions, which runs on the 1-second sync interval and ignores actions with
+        /// no active contributors — reasonably, since without contributors no new labor accrues.
+        /// But EnforcePresence runs EVERY frame, so a commitment that expires at the very moment the
+        /// work finishes removes the last contributor first, and the completed action is then skipped
+        /// forever: 100% progress, no depletion, no transform, no yields.
+        ///
+        /// A skip makes that the normal case rather than a rare race. The clock jumps straight past
+        /// commitStart + committedMinutes, so expiry and completion land in the same instant every
+        /// time — which is exactly the "chop a tree, skip the remainder, it hits 100% and never falls"
+        /// report. Serving your whole commitment must finish the work, not abandon it on the doorstep.
+        /// </summary>
+        private bool TryCompleteInsteadOfStopping(Instance obj, int actionIndex, float now)
         {
-            if (ia == null || ia.timeRequired <= 0f) return 0f;
-            if (!_joinClock.TryGetValue((instanceId, actionIndex, slot), out var joined)) return 0f;
-            float used = Mathf.Clamp01((now - joined) / ia.timeRequired);
-            return 1f - used;
+            var accrual = obj?.location?.accrual;
+            if (accrual == null || actionIndex < 0 || actionIndex >= accrual.Length) return false;
+
+            var state = accrual[actionIndex];
+            if (state.isComplete) return false;
+
+            bool isStationCraft = obj.craft != null && obj.craft.isStation
+                                                    && obj.craft.stationActionIndex == actionIndex;
+
+            float threshold;
+            if (isStationCraft)
+            {
+                threshold = obj.craft.requiredLabor;
+            }
+            else
+            {
+                var def = DefRegistry.Instance?.Get(obj.defId);
+                var ia  = def?.actions != null && actionIndex < def.actions.Length ? def.actions[actionIndex] : null;
+                threshold = ia?.timeRequired ?? 0f;
+            }
+
+            if (threshold <= 0f || state.LaborAt(now) < threshold) return false;
+
+            if (isStationCraft) TriggerStationCraftComplete(obj, actionIndex, now);
+            else                TriggerActionComplete(obj, actionIndex, now);
+            ForcePush();
+            return true;
+        }
+
+        /// <summary>
+        /// Refunds a worker's unserved share of their commitment to this instance+action and vacates
+        /// their slot. One helper for all three exit paths — stop, action complete, craft complete —
+        /// so a refund can never be applied by one and skipped by another.
+        /// </summary>
+        private void SettleCommitment(int slot, int instanceId, int actionIndex, ItemAction ia, float now)
+        {
+            var dreamer = RuntimeDataManager.Instance?.GetDreamer(slot);
+            if (dreamer == null) return;
+
+            int idx = dreamer.IndexOfWorldAction(instanceId, actionIndex);
+            if (idx >= 0)
+            {
+                var commitment = dreamer.actionQueue[idx];
+                RefundCommitmentCost(slot, ia, commitment.committedMinutes, UnusedFractionFor(commitment, now));
+                dreamer.RemoveAt(idx);
+            }
         }
 
         private static void ApplyExhaustion(Game.Simulation.DreamerRecord dreamer, NeedsConfig cfg)
@@ -599,16 +937,32 @@ namespace Game.Networking
                 {
                     var state = obj.location.accrual[i];
                     var ia    = def.actions[i];
-                    if (ia == null || state.isComplete || !state.HasActiveContributors) continue;
+                    if (ia == null || state.isComplete) continue;
 
+                    // Completion is checked WITHOUT requiring active contributors (0.2.11 fix). The
+                    // old guard assumed no contributors meant no new progress and therefore nothing
+                    // to finish — but an action can reach its threshold in the same instant its last
+                    // contributor leaves, and would then sit at 100% forever. The stop paths catch
+                    // that case directly; this is the backstop that also repairs any world already
+                    // saved in the stranded state.
+                    //
                     // Station craft (0.2.10c): threshold is the recipe's requiredLabor (on obj.craft),
-                    // not the def action's timeRequired; completion rolls the tier (§5.7.3).
+                    // not the def action's timeRequired; completion rolls the tier (§5.7.3). Checked
+                    // BEFORE the instant-action guard below, because a station's craft ItemAction may
+                    // legitimately carry timeRequired 0 — the recipe supplies the real threshold.
                     if (obj.craft != null && obj.craft.isStation && obj.craft.stationActionIndex == i)
                     {
-                        if (state.LaborAt(now) >= obj.craft.requiredLabor)
+                        if (obj.craft.requiredLabor > 0f && state.LaborAt(now) >= obj.craft.requiredLabor)
                             craftsToComplete.Add((obj, i));
                         continue;
                     }
+
+                    // Instant actions (timeRequired 0) are resolved by DispatchWorldAction's outcome
+                    // path and never accrue. They MUST be excluded before the threshold test below,
+                    // which would otherwise read 0 >= 0 as "finished" and spontaneously deplete every
+                    // pickup in the world on the next sync tick. The old contributor guard hid this;
+                    // relaxing that guard exposes it, so the exclusion is now explicit.
+                    if (ia.timeRequired <= 0f) continue;
 
                     float labor = state.LaborAt(now);
                     if (labor >= ia.timeRequired)
@@ -617,7 +971,10 @@ namespace Game.Networking
                         continue;
                     }
 
-                    // Proportional rewards: deliver the slice earned since last tick, as work accrues.
+                    // Everything below needs someone actually working: proportional rewards are
+                    // delivered to the present contributors as the work accrues.
+                    if (!state.HasActiveContributors) continue;
+
                     if (ia.yieldModel == YieldModel.Proportional && ia.timeRequired > 0f)
                         DeliverProportionalProgress(obj, i, ia,
                             Mathf.Clamp01(labor / ia.timeRequired), new List<int>(state.contributors));
@@ -646,17 +1003,9 @@ namespace Game.Networking
             var finalContributors = new List<int>(state.contributors);
 
             foreach (int slot in finalContributors)
-            {
-                // Refund the share this worker did not personally do (co-op finishes early, so a
-                // worker's active time < the full timeRequired they were debited up front).
-                RefundActionCost(slot, actionDef, UnusedFractionFor(obj.id, actionIdx, slot, actionDef, clockNow));
-                _joinClock.Remove((obj.id, actionIdx, slot));
-
-                var dreamer = RuntimeDataManager.Instance?.GetDreamer(slot);
-                if (dreamer != null && dreamer.task.processableId == obj.id
-                                    && dreamer.task.actionIndex   == actionIdx)
-                    dreamer.task = new DreamerTask();
-            }
+                // Refund the share this worker did not personally serve — co-op finishes early, so a
+                // worker's served time is usually less than the commitment they were debited up front.
+                SettleCommitment(slot, obj.id, actionIdx, actionDef, clockNow);
 
             state.Complete(clockNow);
             Debug.Log($"[MapEntitySync] World object {obj.id} action '{actionDef.actionId}' complete.");
@@ -777,6 +1126,49 @@ namespace Game.Networking
             inst.location.accrual = accrual;
         }
 
+        // ── Ground snap ──────────────────────────────────────────────────────────
+
+        // Per-Def base offset from PrefabFootOffset — renderer bounds are not free and every
+        // instance of a Def resolves to the same number.
+        private readonly Dictionary<int, float> _footOffsetByDef = new Dictionary<int, float>();
+
+        /// <summary>
+        /// Host: resolve a world placement onto the ground (see <see cref="GroundSnap"/>). Every
+        /// path that puts an Instance InWorld goes through this — yields, drops, unequips, carry
+        /// drops — so a single toggle governs them all.
+        ///
+        /// Called once, at placement: the resolved position is what gets stored, synced and saved.
+        /// Nothing re-snaps afterwards, so save/revert reproduce the placement exactly.
+        /// </summary>
+        /// <param name="defId">Def of the thing being placed — supplies the prefab base offset.</param>
+        /// <param name="ignoreRoot">Existing visual of the object being placed, if it already has
+        /// one (a carried object being dropped stands in its own probe's way).</param>
+        public Vector3 ResolveGroundPosition(Vector3 position, int defId, Transform ignoreRoot = null)
+        {
+            if (!_snapToGround) return position;
+
+            float footOffset = _alignToPrefabBase ? FootOffsetForDef(defId) : 0f;
+
+            return GroundSnap.TryResolve(position, _groundMask, _probeAbove, _probeBelow,
+                       footOffset, _groundClearance, ignoreRoot, out var grounded)
+                ? grounded
+                : position;
+        }
+
+        private float FootOffsetForDef(int defId)
+        {
+            if (_footOffsetByDef.TryGetValue(defId, out var cached)) return cached;
+
+            var def    = DefRegistry.Instance?.Get(defId);
+            var prefab = def?.prefab != null
+                ? def.prefab
+                : (def != null && def.HasWorldActions() ? _processablePrefab : _groundItemPrefab);
+
+            float offset = GroundSnap.PrefabFootOffset(prefab);
+            _footOffsetByDef[defId] = offset;
+            return offset;
+        }
+
         /// <summary>Host: place a plain ground item at the given world position.</summary>
         public void PlaceItem(int defId, float quantity, Vector3 position)
         {
@@ -793,6 +1185,7 @@ namespace Game.Networking
             if (def != null && def.isDurabilityTool && def.maxDurability > 0f)
                 inst.durability = def.maxDurability;
 
+            position      = ResolveGroundPosition(position, defId);
             inst.id       = layer.nextInstanceId++;
             inst.location = new InstanceLocation { kind = LocationKind.InWorld, position = position.ToFloat3() };
             InitWorldAccrual(inst); // world-action Defs become actionable; plain items stay accrual-null
@@ -822,6 +1215,10 @@ namespace Game.Networking
             var accrual     = new ActionAccrualState[actionCount];
             for (int i = 0; i < actionCount; i++)
                 accrual[i] = new ActionAccrualState();
+
+            // The source object's own position is the spawn position, and an authored trunk whose
+            // base is sunk into the terrain would otherwise put its fallen form underground.
+            position = ResolveGroundPosition(position, defId);
 
             var obj = new Instance
             {
@@ -880,7 +1277,7 @@ namespace Game.Networking
         /// <summary>
         /// Host: register a dreamer as a contributor to a world-object action (TDD §5.5.5, 0.2.8b4).
         /// </summary>
-        public void StartContributor(int instanceId, int actionIndex, int dreamerSlot)
+        public void StartContributor(int instanceId, int actionIndex, int dreamerSlot, float committedMinutes = -1f)
         {
             if (!IsServer) return;
             var layer = RuntimeDataManager.Instance?.CurrentMapLayer;
@@ -979,27 +1376,120 @@ namespace Game.Networking
                 return;
             }
 
+            // Single active slot (§5.5, 0.2.11a3): committed labor is exclusive. Checked BEFORE the
+            // contributor is added and before any cost is debited, so a rejected start changes nothing.
+            var slotHolder = RuntimeDataManager.Instance?.GetDreamer(dreamerSlot);
+            if (IsSlotBlocked(slotHolder, instanceId, actionIndex))
+            {
+                Debug.LogWarning($"[MapEntitySync] StartContributor: slot {dreamerSlot} is already committed to " +
+                                 $"{slotHolder.CurrentTaskType()} — one active action at a time.");
+                return;
+            }
+
+            // ── Trivial verbs against the bracket (§5.5.5, 0.2.11d2/d5/d6) ──────────
+            //
+            // The object-side twin of the Trivial consumable path. A verb authored Trivial —
+            // sharpen, mend — resolves NOW: no world-clock advance, no accrual segment, its
+            // timeRequired debited from the bracket. Short bracket and not critical → fall through
+            // and run it as an ordinary Active commitment at full duration (d6), which is the
+            // forgiving answer §5.5.15 #6 settles on.
+            if (actionDef.actionClass == ActionClass.Trivial)
+            {
+                bool covered = slotHolder != null && slotHolder.trivialBracket >= actionDef.timeRequired;
+                if (covered || (slotHolder != null && actionDef.allowsCriticalBypass))
+                {
+                    slotHolder.trivialBracket = Mathf.Max(0f, slotHolder.trivialBracket - actionDef.timeRequired);
+                    Debug.Log($"[MapEntitySync] Slot {dreamerSlot} performed Trivial '{actionDef.actionId}' instantly " +
+                              $"({actionDef.timeRequired:F0}m off the bracket, {slotHolder.trivialBracket:F0}m left)" +
+                              (covered ? "." : " — critical bypass (d5)."));
+
+                    // Instant means the whole labor lands at once: seed the contributor so the
+                    // completion path sees them as the worker, then complete on the same timestamp
+                    // so the clock never moves.
+                    state.AddContributor(dreamerSlot, clock.totalInGameMinutes);
+                    state.accumulatedLabor = actionDef.timeRequired;
+                    TriggerActionComplete(obj, actionIndex, clock.totalInGameMinutes);
+                    ForcePush();
+                    return;
+                }
+
+                Debug.Log($"[MapEntitySync] Slot {dreamerSlot}: bracket too short for Trivial " +
+                          $"'{actionDef.actionId}' — running it as an Active action instead (d6).");
+            }
+
+            // Commitment length (§5.5.3, c1/c2/c3). A negative request means "commit the maximum",
+            // which is the hold-interact gesture; an explicit request is capped to the same ceiling,
+            // so over-commitment is impossible by construction rather than by a later check.
+            float maxCommit = MaxCommitFor(instanceId, actionIndex, dreamerSlot);
+            if (maxCommit <= 0f)
+            {
+                Debug.Log($"[MapEntitySync] StartContributor: slot {dreamerSlot} has nothing to commit " +
+                          $"(no labor left, or day pool exhausted).");
+                return;
+            }
+            float committed = committedMinutes <= 0f ? maxCommit : Mathf.Min(committedMinutes, maxCommit);
+
             state.AddContributor(dreamerSlot, clock.totalInGameMinutes);
 
-            // Up-front cost: debit the whole action cost now; record when this worker joined so their
-            // unused share can be refunded on stop / early completion.
-            _joinClock[(instanceId, actionIndex, dreamerSlot)] = clock.totalInGameMinutes;
-            DebitActionCost(dreamerSlot, actionDef, clock.totalInGameMinutes);
+            // Up-front cost: debit the committed minutes now; the unserved share is refunded when
+            // the commitment ends (stop, expiry, or early co-op completion).
+            DebitCommitmentCost(dreamerSlot, actionDef, committed);
 
             // Proportional rewards start delivering from 0 (seed once, on the first contributor).
             if (actionDef.yieldModel == YieldModel.Proportional
                 && !_proportionalDelivered.ContainsKey((instanceId, actionIndex)))
                 _proportionalDelivered[(instanceId, actionIndex)] = 0f;
 
-            var dreamerRecord = RuntimeDataManager.Instance?.GetDreamer(dreamerSlot);
-            if (dreamerRecord != null)
-            {
-                dreamerRecord.task.type          = TaskType.Gathering;
-                dreamerRecord.task.processableId = instanceId;
-                dreamerRecord.task.actionIndex   = actionIndex;
-            }
+            OccupySlotWithWorldAction(slotHolder, ActionSlotKind.WorldAction, TaskType.Gathering,
+                instanceId, actionIndex, actionDef.actionClass, 0, clock.totalInGameMinutes, committed);
 
             Debug.Log($"[MapEntitySync] Slot {dreamerSlot} started gathering world object {instanceId} action {actionIndex}.");
+        }
+
+        /// <summary>
+        /// Puts object-bound work into the dreamer's single action slot (§5.5, 0.2.11a3).
+        ///
+        /// The record is <c>externallyResolved</c>: SimResolver must never time it out, because its
+        /// progress is piecewise-linear labor accrual on the Instance, not elapsed duration. The
+        /// stop / complete paths (StopContributor, TriggerActionComplete, TriggerStationCraftComplete)
+        /// are what clear it.
+        ///
+        /// Re-entrant by design: a dreamer already bound to THIS instance+action keeps their existing
+        /// record, so resuming or re-confirming does not stack duplicate slot entries.
+        /// </summary>
+        private static void OccupySlotWithWorldAction(Game.Simulation.DreamerRecord dreamer,
+            ActionSlotKind kind, TaskType taskType, int instanceId, int actionIndex,
+            ActionClass actionClass, int recipeId, float now, float committedMinutes)
+        {
+            if (dreamer == null) return;
+            dreamer.actionQueue ??= new List<ActionRecord>();
+            if (dreamer.IndexOfWorldAction(instanceId, actionIndex) >= 0) return;
+
+            dreamer.actionQueue.Insert(0, new ActionRecord
+            {
+                kind               = kind,
+                taskType           = taskType,
+                actionClass        = actionClass,
+                instanceId         = instanceId,
+                actionIndex        = actionIndex,
+                recipeId           = recipeId,
+                externallyResolved = true,
+                started            = true,
+                startTime          = now,
+                committedMinutes   = committedMinutes,
+                commitStart        = now,
+            });
+        }
+
+        /// <summary>
+        /// True when this dreamer already holds the single active slot with work OTHER than the
+        /// given instance+action (§5.5, 0.2.11a3). The presence rule makes committed labor
+        /// exclusive: you cannot fell a tree and craft at a station in the same minute.
+        /// </summary>
+        private static bool IsSlotBlocked(Game.Simulation.DreamerRecord dreamer, int instanceId, int actionIndex)
+        {
+            var active = dreamer?.ActiveAction();
+            return active != null && !active.BindsWorldAction(instanceId, actionIndex);
         }
 
         /// <summary>Host: remove a dreamer as a contributor from a world-object action.</summary>
@@ -1015,19 +1505,19 @@ namespace Game.Networking
             var accrual = obj.location.accrual;
             if (accrual == null || actionIndex < 0 || actionIndex >= accrual.Length) return;
 
-            // Refund the share not worked (the action is unfinished), then forget the join clock.
+            // Refund the unserved share of the commitment and vacate the slot. The accrual segment
+            // closes at `now`, so the labor already done stays on the object — cancel is never
+            // punitive and never loses a chunk (§5.5.4, c4).
             float now = clock.totalInGameMinutes;
             var   def = DefRegistry.Instance?.Get(obj.defId);
             var   ia  = def?.actions != null && actionIndex < def.actions.Length ? def.actions[actionIndex] : null;
-            RefundActionCost(dreamerSlot, ia, UnusedFractionFor(instanceId, actionIndex, dreamerSlot, ia, now));
-            _joinClock.Remove((instanceId, actionIndex, dreamerSlot));
+
+            // The work may already be finished — a commitment that expires exactly as the labor
+            // threshold is met (the normal case after a skip) must complete, not abandon.
+            if (TryCompleteInsteadOfStopping(obj, actionIndex, now)) return;
 
             accrual[actionIndex].RemoveContributor(dreamerSlot, now);
-
-            var dreamer = RuntimeDataManager.Instance?.GetDreamer(dreamerSlot);
-            if (dreamer != null && dreamer.task.processableId == instanceId
-                                && dreamer.task.actionIndex   == actionIndex)
-                dreamer.task = new DreamerTask();
+            SettleCommitment(dreamerSlot, instanceId, actionIndex, ia, now);
 
             Debug.Log($"[MapEntitySync] Slot {dreamerSlot} stopped gathering world object {instanceId} action {actionIndex}.");
         }
@@ -1041,6 +1531,40 @@ namespace Game.Networking
         // leave refunds the unused share and leaves the partial on the station, resumable by anyone
         // (c2). Completion rolls the tier (§5.7.3) and resets the action so the station is reusable —
         // the station is NOT removed.
+
+        /// <summary>
+        /// Applies a station-craft commitment's costs, signed by <paramref name="sign"/> (-1 = debit
+        /// on commit, +1 × unused fraction = refund on leave/complete). Station costs are
+        /// recipe-driven (requiredLabor / energyPerMinute) rather than ItemAction effects, so they
+        /// need their own helper — but the shape mirrors DebitCommitmentCost exactly.
+        /// </summary>
+        private void ApplyStationCommitmentCost(Game.Simulation.DreamerRecord crafter, RecipeDef recipe,
+                                                float committed, float sign)
+        {
+            if (crafter == null || recipe == null || committed <= 0f || sign == 0f) return;
+            var cfg = GetNeedsConfig();
+            SimResolver.ApplyActionEffect(crafter, ResourceStat.TimePool, sign * committed, cfg);
+            if (recipe.energyPerMinute > 0f)
+                SimResolver.ApplyActionEffect(crafter, ResourceStat.Energy, sign * recipe.energyPerMinute * committed, cfg);
+            if (sign < 0f && crafter.timePool < 0f) ApplyExhaustion(crafter, cfg);
+        }
+
+        /// <summary>
+        /// Refunds a station crafter's unserved share and vacates their slot. The station-craft twin
+        /// of <see cref="SettleCommitment"/> — same single-exit-path reasoning, different cost source.
+        /// </summary>
+        private void SettleStationCommitment(int slot, int instanceId, int actionIndex, RecipeDef recipe, float now)
+        {
+            var crafter = RuntimeDataManager.Instance?.GetDreamer(slot);
+            if (crafter == null) return;
+
+            int idx = crafter.IndexOfWorldAction(instanceId, actionIndex);
+            if (idx < 0) return;
+
+            var commitment = crafter.actionQueue[idx];
+            ApplyStationCommitmentCost(crafter, recipe, commitment.committedMinutes, UnusedFractionFor(commitment, now));
+            crafter.RemoveAt(idx);
+        }
 
         /// <summary>Index of the station's craft action (the ItemAction bound to the `craft` verb), or -1.</summary>
         private static int FindCraftActionIndex(Def def)
@@ -1058,7 +1582,7 @@ namespace Game.Networking
         /// (coop only for a second live contributor). Then reserve the contributor's committed labor
         /// + energy and open their accrual segment.
         /// </summary>
-        public void StartStationCraft(int instanceId, int recipeId, int dreamerSlot)
+        public void StartStationCraft(int instanceId, int recipeId, int dreamerSlot, float committedMinutes = -1f)
         {
             if (!IsServer) return;
             var layer = RuntimeDataManager.Instance?.CurrentMapLayer;
@@ -1100,6 +1624,15 @@ namespace Game.Networking
 
             float now = clock.totalInGameMinutes;
 
+            // Single active slot (§5.5, 0.2.11a3): checked before materials are consumed and before
+            // any cost is reserved, so a rejected commit leaves the crafter untouched.
+            if (IsSlotBlocked(crafter, instanceId, craftIdx))
+            {
+                Debug.LogWarning($"[MapEntitySync] StartStationCraft: slot {dreamerSlot} is already committed to " +
+                                 $"{crafter.CurrentTaskType()} — one active action at a time.");
+                return;
+            }
+
             if (obj.craft == null)
             {
                 // ── New craft ──
@@ -1137,19 +1670,26 @@ namespace Game.Networking
                 { Debug.Log($"[MapEntitySync] StartStationCraft: pool exhausted for slot {dreamerSlot}."); return; }
             }
 
+            // Commitment length (§5.5.3, c3) — capped the same way a gather is: the lesser of the
+            // labor the craft still needs and this crafter's day pool. A negative request means max.
+            float maxCommit = MaxCommitFor(instanceId, craftIdx, dreamerSlot);
+            if (maxCommit <= 0f)
+            {
+                Debug.Log($"[MapEntitySync] StartStationCraft: slot {dreamerSlot} has nothing to commit.");
+                return;
+            }
+            float committed = committedMinutes <= 0f ? maxCommit : Mathf.Min(committedMinutes, maxCommit);
+
             state.AddContributor(dreamerSlot, now);
-            _joinClock[(instanceId, craftIdx, dreamerSlot)] = now;
 
             // Reserve this contributor's committed labor (pool) + energy up front; refunded pro-rata
-            // on leave / early completion (co-op). Uses requiredLabor as the per-contributor cost.
-            var cfg = GetNeedsConfig();
-            SimResolver.ApplyActionEffect(crafter, ResourceStat.TimePool, -recipe.requiredLabor, cfg);
-            if (recipe.energyPerMinute > 0f)
-                SimResolver.ApplyActionEffect(crafter, ResourceStat.Energy, -recipe.energyPerMinute * recipe.requiredLabor, cfg);
+            // on leave / early completion (co-op).
+            ApplyStationCommitmentCost(crafter, recipe, committed, -1f);
 
-            crafter.task.type          = TaskType.Gathering; // object-bound handle (station craft rides the gather task slot)
-            crafter.task.processableId = instanceId;
-            crafter.task.actionIndex   = craftIdx;
+            // Object-bound handle: a station craft rides the same single slot as gathering, tagged
+            // StationCraft so the completion/cancel paths can tell them apart (0.2.11a3).
+            OccupySlotWithWorldAction(crafter, ActionSlotKind.StationCraft, TaskType.Crafting,
+                instanceId, craftIdx, recipe.actionClass, recipe.recipeId, now, committed);
 
             ForcePush();
         }
@@ -1176,26 +1716,15 @@ namespace Game.Networking
             var state = obj.location.accrual[craftIdx];
             if (!state.contributors.Contains(dreamerSlot)) return;
 
-            float now     = clock.totalInGameMinutes;
-            var   recipe  = RecipeRegistry.Instance?.Get(obj.craft.recipeId);
-            var   crafter = RuntimeDataManager.Instance?.GetDreamer(dreamerSlot);
-            float unused  = obj.craft.requiredLabor > 0f
-                && _joinClock.TryGetValue((instanceId, craftIdx, dreamerSlot), out var joined)
-                    ? Mathf.Clamp01(1f - (now - joined) / obj.craft.requiredLabor) : 0f;
+            float now    = clock.totalInGameMinutes;
+            var   recipe = RecipeRegistry.Instance?.Get(obj.craft.recipeId);
 
-            if (crafter != null && recipe != null && unused > 0f)
-            {
-                var cfg = GetNeedsConfig();
-                SimResolver.ApplyActionEffect(crafter, ResourceStat.TimePool, recipe.requiredLabor * unused, cfg);
-                if (recipe.energyPerMinute > 0f)
-                    SimResolver.ApplyActionEffect(crafter, ResourceStat.Energy, recipe.energyPerMinute * recipe.requiredLabor * unused, cfg);
-            }
-            _joinClock.Remove((instanceId, craftIdx, dreamerSlot));
+            // Same rule as a gather: a craft whose labor is already served completes rather than
+            // being abandoned at the threshold.
+            if (TryCompleteInsteadOfStopping(obj, craftIdx, now)) return;
 
             state.RemoveContributor(dreamerSlot, now);
-
-            if (crafter != null && crafter.task.processableId == instanceId && crafter.task.actionIndex == craftIdx)
-                crafter.task = new DreamerTask();
+            SettleStationCommitment(dreamerSlot, instanceId, craftIdx, recipe, now);
 
             ForcePush();
             Debug.Log($"[MapEntitySync] Slot {dreamerSlot} left station craft {instanceId} (partial persists, resumable).");
@@ -1218,23 +1747,7 @@ namespace Game.Networking
             var contributors = new List<int>(state.contributors);
 
             foreach (int slot in contributors)
-            {
-                float unused = craft.requiredLabor > 0f
-                    && _joinClock.TryGetValue((obj.id, actionIdx, slot), out var joined)
-                        ? Mathf.Clamp01(1f - (clockNow - joined) / craft.requiredLabor) : 0f;
-                var d = RuntimeDataManager.Instance?.GetDreamer(slot);
-                if (d != null && recipe != null && unused > 0f)
-                {
-                    var cfg = GetNeedsConfig();
-                    SimResolver.ApplyActionEffect(d, ResourceStat.TimePool, recipe.requiredLabor * unused, cfg);
-                    if (recipe.energyPerMinute > 0f)
-                        SimResolver.ApplyActionEffect(d, ResourceStat.Energy, recipe.energyPerMinute * craft.requiredLabor * unused, cfg);
-                }
-                _joinClock.Remove((obj.id, actionIdx, slot));
-
-                if (d != null && d.task.processableId == obj.id && d.task.actionIndex == actionIdx)
-                    d.task = new DreamerTask();
-            }
+                SettleStationCommitment(slot, obj.id, actionIdx, recipe, clockNow);
 
             // Output materialises AT the station for collection (§5.6.5 / c1 "collect at the station"),
             // not auto-delivered — so it is unambiguous who owns it and either crafter can pick it up.
@@ -1322,7 +1835,7 @@ namespace Game.Networking
         /// Routes a world action dispatch (TDD §1.12, 0.2.9c3 / 0.2.9e3): instant actions
         /// (timeRequired == 0) execute by outcome; timed actions delegate to StartContributor.
         /// </summary>
-        public void DispatchWorldAction(int instanceId, int actionIndex, int dreamerSlot)
+        public void DispatchWorldAction(int instanceId, int actionIndex, int dreamerSlot, float committedMinutes = -1f)
         {
             if (!IsServer) return;
             var layer = RuntimeDataManager.Instance?.CurrentMapLayer;
@@ -1361,7 +1874,7 @@ namespace Game.Networking
             }
             else
             {
-                StartContributor(instanceId, actionIndex, dreamerSlot);
+                StartContributor(instanceId, actionIndex, dreamerSlot, committedMinutes);
             }
         }
 
@@ -1430,6 +1943,12 @@ namespace Game.Networking
             {
                 var pos = RuntimeDataManager.Instance?.GetDreamerPosition(dreamerSlot)
                           ?? obj.location.position.ToVector3();
+
+                // The carried object's visual is at the dreamer, directly in the probe's path.
+                _worldVisuals.TryGetValue(obj.id, out var carriedVisual);
+                pos = ResolveGroundPosition(pos, obj.defId,
+                          carriedVisual != null ? carriedVisual.transform : null);
+
                 obj.location = new InstanceLocation
                 {
                     kind     = LocationKind.InWorld,

@@ -246,3 +246,70 @@ Everything that exists at a position in the world, belongs to a specific map, pe
 ## Dead code (CodeFiles scan deferrals)
 
 - **`DreamerCreationUI.cs` still referenced by a scene** — the Build 0.0.1b creation UI, superseded by `CharacterCreationController` at 0.0.1c, could not be deleted in the cleanup pass because its GUID (`a6f71806eee2ba1489bf23cd57d70cdc`) is still bound to a live component. The one reference is **`Assets/Game/Scenes/BootstrapScene.unity`** — GameObject **`DreamerCreationUI`** (MonoBehaviour fileID `934584652`, GameObject fileID `934584651`), a root-level object with no children. No prefabs and no `.asset` files reference it. Deleting the script now would leave a missing-script component in BootstrapScene. **To resolve:** in the Editor, delete that GameObject from BootstrapScene, save the scene, then delete `Assets/Game/Networking/DreamerCreationUI.cs` and its `.meta`. `WorldItemsSync.cs` had zero references and was deleted in the same pass.
+
+## Action & time model revision (0.2.11 deferrals)
+
+- **b4 and c7 disagree about guard-stopped skips, and c7 won.** b4 lists "a guard trip" among the events that end contribution; c7 says a guard-capped skip "advances the clock only as far as it ran… and the remainder continues at 1×", which requires the commitment to survive. They cannot both hold. As built: an **Interrupt** stop releases all presence (`MapEntitySync.ReleaseAllPresenceOnInterrupt`), a **guard** stop leaves the commitment running at 1×. That reading keeps the acceptance script coherent — nothing in it says a guard stop drops the commitment — and is the more forgiving of the two. Reconcile the TDD wording next time §5.5 is edited.
+
+- **Sleep and rest still cost no day-pool time** — §5.5.2 puts sleep/rest/nap on the day pool along with everything else, but the shipped Task channel never debited it and 0.2.11 did not change the economy. `NeedsConfig.CreateTaskAction` mints them with `timeCost = 0` and a comment saying so. Decide the intended cost and wire the debit + pro-rata refund when the sleep economy is tuned.
+
+- **Queue-ahead is consumables-only** — 0.2.11a3 preserved the FIFO queue on the surviving slot, but only duration-driven entries auto-advance: SimResolver stage 4 starts the head entry when it times the previous one out. Object-bound labor and crafts are `externallyResolved` and need an RPC to open their accrual segment, so they are *rejected* while the slot is busy rather than queued behind it. §5.5.16 wants "line up the next two actions while standing at the tree" — that needs a host-side pending-commit queue that re-issues the commit when the slot frees. Not hard, but it is new machinery rather than a tweak.
+
+- **A non-Trivial consumable still occupies the slot** — eat/drink are Trivial after the 0.2.11a2 pass, so they execute instantly and no longer block work. But a consumable authored Active (the save-consumable ritual), or a Trivial one that fell back to Active on a short bracket (d6), takes the single slot for its full duration and blocks gathering until it finishes. That is the §5.5 rule working as designed, not a bug — noted because it reads like one in a playtest.
+
+- **The trivial bracket is unbounded within a day** — d3 converts one pool minute per idle skip minute with no ceiling, and only the wake reset (d4) brings it back to base. Two long skips while idle can bank a very large bracket. §5.5.5 calls the bracket "explicitly bounded", which the wake reset satisfies day-to-day, but a per-day conversion cap may still be wanted once skip lengths are tuned.
+
+- **The skip-consent flow does not reuse `ConsensusVoteComponent`** — §4.5 and that component's own doc-comment say the skip vote should reuse it, but the single instance is owned by `DreamFlowManager` for the Wake Up vote, and a skip request arriving mid-rescue would fight it for the same NetworkVariables. 0.2.11c5/c6 therefore use their own pair of NetworkVariables plus accept/decline/withdraw RPCs on `SkipManager`. Unify when the component is generalised to multiple concurrent votes (it needs an owner/topic key).
+
+- **The can-skip indicator's in-combat term is a seam** — `DreamerNeedsSync.DrawCanSkipIndicator` computes guard-tripped and downed for real; `inCombat` is a hardcoded `false` because there is no combat system until Cluster 3. OR it in there when combat lands — the indicator is already the single place the answer is computed, so it is a one-line change.
+
+- **b5's UI gating was a no-op in code** — the non-modal guarantee (camera, inventory, map, panels, queueing and cancel all live while committed) holds because nothing in the codebase ever gated those on task state. Movement is not suppressed either; walking simply cancels the action via the presence monitor, which is what b5 asks for. If a future build adds a "you are busy" input gate, this guarantee has to be defended explicitly.
+
+- **v19 → v20 save migration is a one-off, not a framework** — `SaveSystem.PromoteTwoChannelDreamer` + `TwoChannelSchemaVersion` accept a single legacy schema so pre-0.2.11 dev saves still load (a5). Only sleep/rest are promoted with their remaining duration; a legacy Gathering/Crafting marker is dropped (its real state lives on the Instance/CraftRecord and re-opening it needs the accrual segment and join clock the marker never held). **Delete both at the next schema bump** — the standing rule (CLAUDE.md) is that old saves are rejected loudly until Early Access.
+
+- **`ActionClass` is authored in three places, not one** — `ActionDef` (world/inventory verbs), `ConsumableAspect` (eat/drink), and `RecipeDef` (crafts), because those are three independent def kinds with no common base. Sleep/rest are config fields on `NeedsConfig`. Nothing derives a class implicitly, but a single authoring surface — or an editor validator that lists every def and its class — would make the reclassification pass auditable rather than manual.
+
+- **Presence range and tolerance are global, not per-action** — b1 says "within the task's interaction range", implying a per-def range. As built there are two `NeedsConfig` values (`presenceRange`, `presenceMoveTolerance`) shared by every action. Per-action ranges belong on `ItemAction` alongside `timeRequired` when an action needs a genuinely different reach (a long saw vs. a berry bush).
+
+- **Instant eating retires the gradual-nourishment buff for food** — 0.2.3b5 delivered a meal's hunger/thirst over its duration via the `nourishment_hunger` / `nourishment_thirst` buffs, tick by tick. Food and drink are now Trivial and unconditionally instant, so there is no window to spread restoration over: `ConsumeItemServerRpc` applies `hungerTotal` / `thirstTotal` whole. The buff defs, `ActionRecord.HungerPerMin/ThirstPerMin` and `SimResolver.InstallNourishmentBuffs` all still exist and still work — they are simply unreachable for Food/Drink now, since those can no longer take the Active path. Decide whether gradual restoration comes back as a *post-meal* buff (eat instantly, digest over the next hour, which is both more realistic and keeps the Trivial rule intact), or whether the machinery should be deleted. Do not leave it in limbo indefinitely — unreachable code that looks live is worse than either outcome.
+
+- **Partial food items restore by `hungerTotal`, not `def.hungerRestore`** — the pre-0.2.11 instant-consume branch (`duration <= 0`) applied the Def's *full* restore values even when the item was a partial, so eating half a berry ration healed like a whole one. The unified instant path uses the partial-aware `hungerTotal` / `thirstTotal`. Called out because it is a silent behaviour fix riding along with 0.2.11d, not an intended change of that build — verify it against the intended partial-item economics rather than assuming the new number is right.
+
+## Dreamer spawn points (scene-authored spawn locations)
+
+- **Spawn facing is not persisted.** A `DreamerSpawnPoint`'s yaw is applied at spawn (FirstPersonLook adopts the body's authored heading on enable), but `DreamerRecord` carries a position and no rotation, so a loaded save restores where the dreamer stood and *not* which way they faced. Add a yaw field to `DreamerRecord` at the next schema bump if restored facing matters — it is a one-field change plus the template update, deliberately not taken now to avoid a schema bump for a testing convenience.
+
+- **Spawn points are scene objects, not world data.** The markers live in the Action scene and are resolved at spawn time by `DreamerSpawnPoints`. That is the right shape for one hand-built map, but the eventual needs — per-region entry points, dream/rescue wake locations, moving the "camp" as the story progresses — want spawn locations as authored *data* keyed by id, with the scene markers reduced to their visual representation. Revisit when world authoring (Cluster 4 placement / the map pass) lands.
+
+- **Ground snap needs a collider.** `_snapToGround` is a physics raycast, so it resolves against the TerrainCollider or any mesh collider below the marker. A marker placed over a collider-less visual (or outside the terrain) keeps its authored height and logs nothing. If spawning over holes/water becomes routine, add a validation pass that flags markers with no ground under them.
+
+- **`Policy.Always` is a testing mode that silently defeats save restore.** Left on, every load puts the dreamers at the marker instead of where the save says. It is documented in the Inspector tooltip and logged on each spawn (`(spawn point)` vs `(record)` in the spawn log line); no harder guard than that. Set the shipping scene back to `NewGameOnly` before any build that is not a test.
+
+## Ground snap for world placements
+
+- **Ground snap is a raycast, not physics settling.** `GroundSnap` puts an object's base on the first
+  qualifying surface directly beneath (or, if buried, above) its pivot. It does not orient to the
+  slope normal, does not resolve horizontal overlap, and will happily rest a long log's midpoint on a
+  ridge with both ends in the air. If yields start looking wrong on rough terrain, the next step is
+  orienting to the surface normal and/or a brief rigidbody settle at placement — both are bigger
+  changes than this was, and both need a decision about whether the settled position (not the
+  authored one) is what gets saved.
+
+- **The above-fallback can lift a placement onto a roof.** When nothing qualifies *below* a position,
+  the resolve uses the lowest surface *above* it — which is what rescues a yield from inside the
+  terrain. Inside an enclosed space with no floor collider beneath (a future cave, a raised platform
+  with an open underside), the same rule would put the object on the ceiling instead. Probe Above on
+  `MapEntitySync` bounds how far that can reach; revisit if interiors become real geometry.
+
+- **`Align To Prefab Base` trusts renderer bounds.** The per-Def base offset comes from the combined
+  renderer bounds of the Def's prefab, cached on first use. A prefab carrying an oversized renderer
+  (an effect volume, a debug visual) reads as taller than the object looks and will hover. The offset
+  is clamped to "base at or below pivot, within 50 m" and otherwise falls back to placing by pivot —
+  so a bad prefab degrades to the old behaviour rather than flinging things into the sky, but it is
+  still worth an authoring check when a Def gets its real art.
+
+- **Authored nodes are deliberately not snapped.** `ResolveWorldObject` materialises an authored node
+  at its scene GameObject's position, on the grounds that a hand-placed node's position is authored
+  intent. That means an authored node sunk into the terrain stays sunk — only what it *yields* is
+  lifted out. If authored nodes should also be corrected, that belongs in an editor-time validation
+  pass over the scene, not at runtime.

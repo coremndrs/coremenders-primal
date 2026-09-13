@@ -2433,6 +2433,369 @@ Run the existing **0.2.9 Consolidated setup + regression** (TDD §5.7, Parts B�
 
 ---
 
+## Build 0.2.11 — Action & time model revision (a: classes + slot collapse · b: presence · c: commit flow · d: trivial bracket · e: partner HUD)
+
+> **What changed (code, by Claude Code).** The §5.5 revision, in full. Committed active labor is now
+> **presence-bound**: a dreamer stands at the work, and the work stops when they leave. That one rule
+> pulls in the action taxonomy (a), the presence rules (b), a commit flow with a wait-or-skip decision
+> attached (c), the trivial bracket that keeps maintenance from costing six real minutes each (d), and
+> the partner element without which none of the co-op coordination is usable (e).
+>
+> Nothing was rewritten from scratch. The timestamp core, the day pool, the piecewise-linear accrual
+> engine, the resolver and save/revert are all untouched. **Schema bumped 19 → 20** — see the save note.
+>
+> **(a) Classes + the channel collapse**
+> - **`ActionClass`** (new, Simulation) — Active / Trivial / Passive per §5.5.1. `Active = 0` on
+>   purpose: an unauthored def reads as the conservative class, since a mis-defaulted Trivial would
+>   hand the player free hours while a mis-defaulted Active only costs them time.
+> - **`ActionSlotKind`** (new, Simulation) — Consumable / Task / WorldAction / HandCraft /
+>   StationCraft. Tells the host **who resolves completion**.
+> - **`DreamerTask` is deleted.** It was the second active slot — the one that let a dreamer eat and
+>   fell a tree in the same minute. Sleep, rest, gathering, hand craft and station craft now all
+>   occupy `DreamerRecord.actionQueue[0]`, and the **FIFO queue survives on it**.
+> - **`SimResolver`** — stages 4a and 4b merge into one stage 4 over the single slot; sleep/rest
+>   payouts move into `FireActionCompletion`. `externallyResolved` entries are *started* here but
+>   never *completed* here. tick == jump is unchanged: still one advance path.
+> - **`allowsCriticalBypass`** added to `ActionDef` and `ConsumableAspect` — now live, read by d5.
+>
+> **(b) Presence binding**
+> - **`MapEntitySync.EnforcePresence`** runs **every frame** (not on the sync interval — leaving must
+>   stop accrual at the instant you leave). Two shapes: object-bound work measures distance to the
+>   Instance (`presenceRange`, default 4 m); self-contained work — hand craft, rest, sleep — carries a
+>   **presence anchor** stamped where it was committed and cancels past `presenceMoveTolerance`
+>   (0.75 m). Both measure **horizontally only**, so standing on a log or jumping never drops you.
+> - Leaving retains progress and does **not** auto-resume — coming back needs a fresh commit (b1).
+>   Accrual rate is therefore the sum of *present* contributors, with the segment math untouched (b2).
+> - A movement-cancelled **sleep** routes through the same cut-short wake resolver as a
+>   skip-interrupted one, so its partial protection buff and checkpoint bank identically.
+> - **Interrupt → presence end** (b4): an Interrupt-caused skip stop releases every contributor.
+>   *A guard-caused stop deliberately does not* — see the b4/c7 conflict note in TODO.md.
+>
+> **(c) Commit flow**
+> - **Commitments are sized.** `ActionRecord` gains `committedMinutes` / `commitStart`. A commit
+>   reserves *that* from the day pool — not the action's full `timeRequired` — and refunds the
+>   unserved share on stop, expiry or early co-op completion. Energy costs scale to the committed
+>   share, so a 15-minute slice of a 60-minute fell costs a quarter of the energy rather than all of it.
+> - **Capped at `min(remaining labor, day pool)`** by `MapEntitySync.MaxCommitFor`, on the host. The
+>   menu hides over-cap options rather than greying them, and the host caps again on receipt.
+> - **Tap E → duration menu; hold E → commit the maximum.** Max-on-hold is what defuses §5.5.15 #2's
+>   "the largest commitment is always optimal, so the picker is a false choice": the optimal play is
+>   the one-gesture default and the menu becomes a deliberate override. The hold is on the interact
+>   key, **not** Left Ctrl, so it cannot collide with FP precision aim.
+> - **Wait-or-skip** (c5/c6): a committed dreamer can request a skip defaulting to what they still
+>   owe. Solo proceeds; co-op surfaces Accept / Not now to the partner. A decline touches nothing —
+>   the committer can still wait, or cancel and keep both their progress and their unspent time.
+> - **`_joinClock` is gone.** It was an in-memory dictionary, so after a revert every join clock was
+>   lost and the next refund silently computed against a missing key. Refunds now read the persisted
+>   slot record, which makes them revert-exact.
+>
+> **(d) Trivial bracket**
+> - **`DreamerRecord.trivialBracket`** + `NeedsConfig.trivialBracketDailyBase` (60). Serialised,
+>   synced, revert-clean.
+> - **Trivial execution** resolves instantly, advances the world clock by **nothing**, and debits its
+>   duration from the bracket — implemented for both Trivial **consumables** (eat/drink) and Trivial
+>   **verbs** on objects (sharpen/mend).
+> - **Eating and drinking are unconditional.** Their class is *derived* from `consumeEffect`, not
+>   authored, so no Def can miss the reclassification; and they are exempt from both the bracket gate
+>   and the d6 Active fallback, so they always execute instantly and never occupy the action slot.
+>   Neither can they block work, nor be blocked by it. The bracket is still debited (floored at 0) so
+>   the accounting stays honest. The inventory button now reads **Eat** / **Drink** / **Use** by
+>   effect, instead of one generic "Use" for food, water and axes alike.
+>   *Consequence: the 0.2.3b5 gradual-nourishment buff no longer fires for food — an instant meal has
+>   no window to spread restoration over, so hunger/thirst are restored whole. Logged in TODO.md.*
+> - **Idle-skip conversion** (d3): each skip minute a dreamer passes **uncommitted** moves one minute
+>   from their general pool into their bracket. Committed = holding an Active-class slot entry, so
+>   sleeping does not convert.
+> - **Wake resets** the bracket to base — an assignment, not an addition, which is what makes unspent
+>   bracket minutes expire at sleep (d4).
+> - **Critical bypass** (d5) executes on an empty bracket; **short bracket falls back to Active** at
+>   full duration rather than hard-blocking (d6).
+>
+> **(e) Partner status** — an always-visible element (top-right) reading the partner's *already
+> replicated* NetworkVariables, so it costs no extra wire traffic: vitals, needs, engaged/idle state,
+> distance, and the **can-skip indicator**, derived from the same guard floors SimResolver checks so
+> the light cannot disagree with the outcome.
+
+### Wiring / setup
+
+- [x] **Reclassify every shipped `ActionDef` asset** *(a2 — the authoring pass)*
+  - For each **Action Verb** asset, set **Action Class** under the *Class (§5.5.1)* header:
+    - **Active** — `fell`, `process`, `chop`, `gather`, `mine`, `butcher`, `craft`, `build`
+    - **Trivial** — `sharpen`, `mend`, and any maintenance verb whose *instant* execution confers no
+      meaningful advantage
+    - **Passive** — `drying`, `curing`, `tanning` (none authored yet; set the class when they are)
+  - `pickup`, `split`, `carry` and any other `timeRequired = 0` verb: leave **Active**. They resolve
+    instantly through the outcome path and never open a slot, so the class is not read for them.
+  - *Why: every shipped def must carry an authored class — none may sit on the default by accident.
+    An unset Trivial verb silently costs world time instead of bracket minutes, which is the failure
+    that is hardest to spot in play.*
+
+- [x] **Set `Action Class` on the non-food consumable Defs only** *(a2)*
+  - **Food and Drink need no authoring** — their class is derived from `consumeEffect`, so every
+    edible is Trivial and instant whether or not anyone remembers to set the field. The Inspector
+    field is ignored for them.
+  - The only consumables to author are the others: leave the **save consumable**
+    (`consumeEffect = SaveConsumable`) on **Active** — it is a ritual with a real duration, not
+    maintenance.
+  - *Why: eat and drink are the headline Trivial cases (§5.5.1), and one un-reclassified Def would
+    silently turn a meal into a clock-advancing action that occupies the dreamer's single slot — a
+    bug invisible until playtest. Deriving it removes the chance of that entirely.*
+
+- [x] **Author `Allows Critical Bypass`** *(a4, activated by d5)*
+  - Tick it on exactly the Defs that already have **Allows Overdraft** ticked on their Consumable
+    Aspect — the survival list. On `ActionDef` verbs, tick it only on a future `bandage`-style verb.
+  - *Why: keeping the two lists identical is what stops the bypass becoming a general escape hatch
+    now that d5 reads it. Every def you tick here can be performed on an empty bracket, forever.*
+
+- [x] **Set `Action Class` on every `RecipeDef`** *(a2)*
+  - Every recipe asset → **Active**. It defaults to Active, so this is a confirmation pass — open
+    each and check rather than assume.
+
+- [x] **Confirm the needs-task classes and the new tuning values on `WorldClockDriver`** *(a2, b, d1)*
+  - On **WorldClockDriver**'s `Needs Config` — **and the duplicate copies on `DreamerTaskSync` /
+    `DreamerInventorySync`, which must match** — set:
+    - **Sleep Action Class** = Active, **Rest Action Class** = Active
+    - **Trivial Bracket Daily Base** = `60` *(d1's authored value)*
+    - **Presence Move Tolerance** = `0.75` *(b3 — how far you may drift before a hand craft / rest /
+      sleep cancels)*
+    - **Presence Range** = `4` *(b1 — how far from an object before contribution ends)*
+  - *Why: presence range must sit slightly **above** `InteractableDetector`'s Interact Range (3.5), or
+    you would be dropped from work you can still reach — which reads as a bug, not a rule. And these
+    NeedsConfig copies have drifted before; check all of them.*
+
+- [x] **`InteractableDetector` commit-gesture values on the dreamer prefab** *(c1/c2)*
+  - **Hold To Commit Seconds** `0.35` — how long E must be held before it counts as hold-for-max
+    rather than a tap. Raise if you find yourself opening the menu by accident, lower if the hold
+    feels sluggish.
+  - **Commit Options Minutes** — the duration menu, default `15 / 30 / 60 / 120`. Edit freely; any
+    option above the cap is hidden at runtime, so over-long entries cost nothing but clutter.
+  - Confirm **Precision Key** is still `LeftControl` and **Action Menu Key** is still `E`.
+  - *Why (c2 explicitly asks for this check): the hold gesture and FP precision aim must not collide.
+    They do not, because the hold lives on the interact key and precision on Left Ctrl — verify that
+    is still true if you have rebound either.*
+
+- [x] **Partner status element** *(e1 — layout)*
+  - On the dreamer prefab's `DreamerNeedsSync`, leave **Show Partner Status** ticked. The element
+    draws top-right; move or restyle it in `DrawPartnerStatus` if it fights the dev menu, which also
+    lives in that corner.
+  - *Why: e1's logic is done and reads only already-replicated state; only the placement is authored.*
+
+- [x] **Delete the old save slot before first Play** *(a5)*
+  - Delete `%USERPROFILE%\AppData\LocalLow\<Company>\<Product>\Saves\slot_0`, **or** keep it to
+    exercise the v19 → v20 promotion (test 8 below). Checkpoint directories (`Saves\checkpoint_*`)
+    are v19 too and migrate by the same path.
+  - *Why: the template is already v20 and needs no action; only real saves on disk are v19.*
+
+### Playtest validation — single client
+
+1. **Sleep and rest still work through the new slot.** Press Play. **Rest** to completion, then
+   **Sleep** (or skip through it).
+
+   - [ ] ✅ The task HUD shows `Task: Resting` with a bar that fills to the configured duration, then
+     returns to `Task: Idle` with energy up by `restEnergyRestore`; sleep behaves the same and banks
+     its checkpoint exactly as before.
+
+2. **One active slot.** Idle, click **Rest**, then immediately try to (a) **Sleep**, (b) start a
+   **Gather** on a spawned processable, and (c) consume a food item.
+
+   - [ ] ✅ Sleep is refused (`already committed to Resting`) and Rest keeps running untouched.
+
+   - [ ] ✅ The gather is refused (`slot N is already committed to Resting`) **and no cost was
+     debited** — timePool and energy are unchanged from before the click.
+
+   - [x] ✅ The food is eaten **instantly** and does not queue: it costs bracket minutes rather than
+     the slot, and the Rest keeps running uninterrupted. The inventory button reads **Eat** (or
+     **Drink** for a liquid), not "Use".
+
+3. **Presence — self-contained.** Start a **hand craft**, then walk a couple of metres away.
+
+   - [ ] ✅ The craft cancels on its own as you step away, the materials come back, and the unelapsed
+     time and energy are refunded — no penalty for leaving.
+
+   - [ ] ✅ Shifting your weight on the spot (small mouse-driven settle, a jump) does **not** cancel
+     it — only a deliberate step away does.
+
+4. **Presence — object-bound.** Spawn a processable, commit to a timed action, watch the progress
+   climb, then walk out of range and come back.
+
+   - [ ] ✅ Progress stops climbing the moment you leave, the Console logs `left the work at
+     instance N`, and the partial labor stays on the object.
+
+   - [ ] ✅ Walking back does **not** resume it — progress stays frozen until you commit again, and
+     re-committing continues from the partial rather than restarting.
+
+5. **Commit flow — tap vs hold.** Look at the object. **Tap E**, then **hold E**.
+
+   - [ ] ✅ Tap opens the action menu; clicking a timed action expands a `commit for…` row showing
+     only durations at or below the cap, plus an `all Nm` button. An option above the cap is never
+     drawn (drain your pool with movement and re-check — the long options disappear).
+
+   - [ ] ✅ Hold E commits the maximum immediately with no menu, and the commitment bar appears.
+
+   - [ ] ✅ **An authored, never-touched scene tree offers durations** *(regression guard)*. Do this
+     on a tree straight out of the scene that nobody has interacted with since Play started — not a
+     dev-spawned one, and not one already part-chopped. The menu must offer real durations. `no time
+     to commit` there means the cap is being looked up in the replicated world-object payload, which
+     an authored node is absent from until first interaction (0.2.9f is delta-only, so a pristine
+     node costs nothing and therefore exists nowhere). Absent must read as *pristine*, not as
+     *nothing to commit*.
+
+   - [ ] ✅ Holding **Left Ctrl** still narrows the aim probe as before, and the two gestures never
+     interfere *(this is c2's explicit check)*.
+
+6. **Commit flow — cap, expiry and cancel.**
+
+   - [ ] ✅ Commit a short duration (15m) to a long action: the commitment bar counts up, and when it
+     expires contribution ends by itself with the remainder left on the object — Console logs
+     `commitment expired`.
+
+   - [ ] ✅ **Commit-then-skip completes the work** *(regression guard)*. Commit to felling a tree,
+     then use **Skip the remaining Nm**. When the skip ends the tree must reach 100% **and actually
+     transform** — the standing tree is replaced by the felled-tree object and the yields are
+     delivered. Progress reaching 100% with the tree still standing is the specific bug this guards:
+     the commitment expiring in the same instant the labor threshold is met used to remove the last
+     contributor before completion was ever checked.
+
+   - [ ] ✅ **Instant pickups are untouched** *(regression guard for the same fix)*. Drop a few items
+     on the ground and leave them there for a minute or two of real time without interacting.
+     They must still be lying there — none may vanish or "complete" on their own.
+
+   - [ ] ✅ Cancel mid-commitment via **Stop**: unelapsed time and energy are refunded, progress is
+     retained on the object, and there is no cancellation penalty.
+
+7. **Trivial bracket.** Watch the **Trivial:** row under Pool in the bottom-left HUD.
+
+   - [ ] ✅ It starts at the authored base (60m), is visually distinct from **Pool**, and is labelled
+     so it cannot be read as spendable on work.
+
+   - [ ] ✅ Eating debits it by the food's duration and the **world clock does not advance** — check
+     the clock readout across the meal, not just the bracket.
+
+   - [ ] ✅ Drain the bracket to 0, then eat and drink again: **both still execute instantly**, the
+     bracket stays floored at 0, and neither takes the action slot. Food and drink are never gated —
+     a dreamer who had to abandon their work to eat would be the presence rule turned against the
+     player.
+
+   - [ ] ✅ Still with the bracket at 0, perform a Trivial **verb** (a sharpen/mend action on a tool,
+     once one is authored): *that* falls back to running as a full Active action at its full duration
+     rather than failing — Console logs the d6 fallback. This is the d6 case; food is not.
+
+8. **v19 → v20 save migration** *(a5 — only if you kept a pre-0.2.11 save)*. Restore a v19 `slot_0`,
+   ideally one saved **while a dreamer was mid-sleep**, and load it.
+
+   - [ ] ✅ It loads with no exception; the Console shows `(migrated v19 → v20)` and, for a sleep in
+     flight, `Migrated slot N: Sleeping promoted…` — and the dreamer resumes sleeping with the
+     correct remainder.
+
+9. **Save / revert clean.** Commit to an object action, take a checkpoint mid-commitment, let it run
+   on, then Revert.
+
+   - [ ] ✅ The commitment bar comes back showing the **exact** elapsed/remaining it had at the
+     checkpoint (it is clock-derived, so it must match precisely, not approximately), the object's
+     partial labor matches, and the trivial bracket is restored to its checkpoint value.
+
+### Playtest validation — two clients (MPPM)
+
+Enable one Virtual Player (Window → Multiplayer → Multiplayer Play Mode) and press Play.
+
+1. **Partner status element.** Look at the top-right panel on each client.
+
+   - [ ] ✅ Each client shows the *other* dreamer's vitality, needs, state and distance, live, with no
+     panel to open — and the numbers track as the partner eats, works and moves.
+
+   - [ ] ✅ The **Can skip** indicator reads `✔ ready` while the partner is healthy, and flips to
+     `✘ needs low` when you drive their hunger below the skip guard (dev **Set Critical**), and to
+     `✘ downed` if they are incapacitated.
+
+2. **The commit menu works on the CLIENT** *(regression guard — run this from the Virtual Player,
+   not the host)*. On the **client**, look at a processable and tap **E**, then click a timed action.
+
+   - [ ] ✅ The `commit for…` row lists real durations with a sensible `max Nm`. It must **not** say
+     `no time to commit` — that message means the cap came back 0, which is what happens if the menu
+     is reading host-only state (`RuntimeDataManager`) instead of replicated state.
+
+   - [ ] ✅ Picking a duration actually starts the work on the client, and **hold E** commits the
+     max there too.
+
+   - [ ] ✅ Every check in this file that involves a UI decision should be run from the client at
+     least once. Host-only state reads are invisible when testing as host — the host has the RDM, so
+     the bug simply does not appear there.
+
+3. **Co-op accrual follows presence — the headline test.** Spawn a tree-like processable. **A**
+   commits by holding E; **B** walks over and commits too.
+
+   - [ ] ✅ Progress accrues at **2×** with both present.
+
+   - [ ] ✅ **B walks away → it drops to 1×** immediately, with B's unserved share refunded and B's
+     slot free. A keeps working.
+
+   - [ ] ✅ **Both walk away → 0×**, progress held exactly where it stopped; either dreamer can
+     return and resume it from there.
+
+4. **Wait-or-skip, refused.** While A is committed and B is away, A clicks
+   **Skip the remaining Nm**.
+
+   - [ ] ✅ B sees a `Dreamer A wants to skip Xh` panel with **Skip together** / **Not now**; A sees
+     `Waiting for your partner…` with **Withdraw**.
+
+   - [ ] ✅ B clicks **Not now** → the panel clears and **A's commitment is completely intact**: the
+     bar is still running, and A can immediately either keep waiting or cancel and get their unspent
+     time back with progress retained *(c6 — a refusal must never lock the committer in)*.
+
+5. **Wait-or-skip, accepted.** Both commit to the tree, then A requests a skip and B accepts.
+
+   - [ ] ✅ The skip runs and the tree's labor advances by the skipped span at the co-op rate; if the
+     commitment completes inside the skip, the yields are delivered and both slots free.
+
+6. **Partial-skip remainder** *(c7)*. Set one dreamer's needs near the guard floor
+   (dev **Set Critical** is too far — nudge it so the guard trips partway), commit, and skip.
+
+   - [ ] ✅ The skip halts on the guard, the clock advanced only as far as it ran, labor accrued for
+     exactly that span, **and the commitment is still running** — it continues at 1× rather than
+     being dropped.
+
+7. **Interrupt ends presence** *(b4)*. Both commit to the tree, start a long skip, and press **F5**
+   mid-skip to inject a debug interrupt.
+
+   - [ ] ✅ The skip stops, both dreamers are released from the tree (Console: `Interrupt released
+     slot N`), and the tree holds its partial progress at the interrupt's timestamp. Note the
+     contrast with test 5: a **guard** stop keeps the commitment, an **interrupt** ends it.
+
+8. **Non-modal while committed** *(b5)*. With A committed to the tree, open every panel in turn:
+   inventory (**I**), the pause menu (**Esc**), the dev menu, the action menu (**E**).
+
+   - [ ] ✅ All of them open and work normally while committed — nothing is greyed out or swallowed.
+
+   - [ ] ✅ Pressing **W** is not blocked; A simply walks, and the commitment ends because they left
+     — movement cancels rather than being suppressed.
+
+9. **Idle-skip conversion and the wake reset** *(d3/d4)*. Note B's Pool and Trivial values. Have A
+   commit to something while **B stands idle**, then run a 2h skip.
+
+   - [ ] ✅ B's **Trivial** grew by ~120m and their **Pool** shrank by ~120m; **A's did not change**,
+     because A was committed (Active) for the skip.
+
+   - [ ] ✅ Now sleep both dreamers. On wake, **both brackets read exactly the daily base** — B's
+     banked 120m is gone, not carried over *(d4 — leftovers are lost at sleep)*.
+
+10. **Save / revert clean, two clients.** With A mid-commitment on the tree and B mid-rest, take a
+   checkpoint, let both run on, then Revert.
+
+   - [ ] ✅ Both clients come back with identical commitment bars, identical object labor, and
+     identical Pool / Trivial values — and the bars are exact on both peers, not merely close.
+
+11. **Combined acceptance run** *(the TDD's 0.2.11 acceptance script, end to end)*. A commits to
+    felling via hold-interact; B joins → 2×; B leaves → 1×. A requests a skip while B is away, B's
+    indicator shows unavailable, A declines to wait and cancels — progress held, time refunded. B
+    returns, both commit, both agree to skip, the tree completes inside the skip. B, idle through an
+    earlier 2h skip, eats and sharpens instantly; A, with an empty bracket, sharpens as a full Active
+    action instead. Both sleep; brackets reset to base.
+
+    - [ ] ✅ The whole sequence plays through as written, with save/revert clean throughout and
+      progress bars exact on both clients after a revert.
+
+---
+
 ## Setup — Git & Archives
 
 Infrastructure task, not a gameplay build. Phases 1–7 of `Docs/Setup-Git-Migration.md`
@@ -2524,3 +2887,231 @@ machine-local configuration, so it falls to you.
   `git ls-files -z | xargs -0 git check-attr filter | grep "filter: lfs"` — empty
   output is correct. Do **not** verify with `git lfs ls-files`: any `git lfs`
   command writes an `[lfs]` marker into `.git/config`.
+
+---
+
+## Tooling — Authored dreamer spawn points
+
+> *(Not a TDD build — a workflow change requested while the terrain is being built, so dreamers can
+> be spawned anywhere on the map without editing JSON. No simulation, save-format or schema change:
+> **no save reset needed**, and a scene with no markers behaves exactly as before.)*
+
+> **What changed (code, by Claude Code):** spawn position used to come only from
+> `DreamerRecord.position` — i.e. `StreamingAssets/Templates/dreamer_<slot>.json` on New Game, or the
+> save on load. Two new Networking components let the scene decide instead.
+>
+> - **`DreamerSpawnPoint`** (new, Networking) — a marker component for an empty GameObject. Fields:
+>   **Id** (blank = the GameObject's name) used to select it, and **Slot** (`0` host dreamer,
+>   `1` joining dreamer, `-1` either). Its **position** is the spawn point and its **yaw** is the
+>   facing the dreamer starts with — `FirstPersonLook` adopts the body's authored heading on enable,
+>   so the arrow is literally where the camera looks on spawn. Draws a capsule + facing-arrow gizmo
+>   with its id/slot labelled, so markers stay findable while sculpting terrain.
+> - **`DreamerSpawnPoints`** (new, Networking) — one per scene, the resolver. **Policy** decides when
+>   markers win over the record: **NewGameOnly** (default — a fresh session only, so saved games still
+>   land where the player left them), **Always** (testing: markers win even on load), **Disabled**
+>   (old behaviour). **Active Point Id** picks which marker is live — author several around the map
+>   and switch by typing an id. With the field blank the first marker (ordinal by id) is used.
+>   **Snap To Ground** raycasts down and stands the capsule's feet on the surface, using the prefab's
+>   `CharacterController` height/centre/skin width — so markers stay valid while terrain height is
+>   still moving, and you never spawn buried or falling. Dreamer colliders are skipped by that cast
+>   (slot 1 spawns while slot 0 already exists). A shared (`-1`) marker offsets the second dreamer by
+>   **Slot Spacing** metres along the marker's right so the two do not spawn inside each other.
+> - **`GameFlowManager`** — tracks `_positionsFromTemplate` (set by `BeginHost`, cleared by
+>   `BeginLoad` / `LoadGame` / revert, since revert routes through `LoadGame`), and `SpawnSlot` now
+>   asks `DreamerSpawnPoints` for a pose first. When a marker is used, the resolved position is
+>   **written back into the `DreamerRecord`** before the spawn, so the RDM, the save and the body
+>   agree from frame one. The spawn log line now names the source: `… (spawn point)` or `(record)`.
+> - **`DreamerSpawner`** (BootstrapScene debug spawner) — same marker path (its session is always
+>   template-sourced), plus the missing unsubscribe-before-subscribe guard on
+>   `OnClientConnectedCallback` (NGO lifecycle rule 5).
+
+### Wiring / setup
+
+- [x] **Let Unity generate the `.meta` files for the two new scripts.**
+  - Focus the Editor so it imports `Assets/Game/Networking/DreamerSpawnPoint.cs` and
+    `DreamerSpawnPoints.cs`, then confirm both `.cs.meta` files exist on disk before committing.
+  - *Why: script and meta must be committed together, and the GUID is what the scene reference
+    binds to.*
+
+- [x] **Add the spawn-point manager to the Action scene.**
+  - Open `Assets/Game/Scenes/Action.unity`. Create an empty root GameObject named
+    **`SpawnPoints`** at the origin and add Component → **Dreamer Spawn Points**.
+  - Leave **Policy** = `New Game Only`, **Active Point Id** blank, **Points** empty (it auto-collects
+    every marker in the scene on Awake), **Snap To Ground** on, **Slot Spacing** `1.5`.
+  - Set **Ground Mask** to the layer(s) your terrain/ground colliders live on (`Default` unless the
+    terrain has its own layer). Leaving it `Everything` also works — it just means a prop lying under
+    the marker can become the surface you stand on.
+  - *Why: this is the one object the spawn path looks for. With it absent, spawning falls back to the
+    template/save position exactly as before — nothing breaks.*
+
+- [x] **Author the first spawn marker.**
+  - Create an empty child of `SpawnPoints` named e.g. **`Camp`**, position it where you want the
+    dreamers to start on the terrain, and **rotate it around Y** to aim the starting view.
+  - Add Component → **Dreamer Spawn Point**. Leave **Id** blank (the name `Camp` is then the id) and
+    **Slot** = `-1` so it serves both dreamers.
+  - *Why: one shared marker is the normal case; the second dreamer is stepped 1.5 m to its right
+    automatically.*
+
+- [ ] **(Optional) Author more markers for testing and switch between them.**
+  - Duplicate the marker, move it elsewhere on the map, rename it (`Lake`, `Ridge`, `Cave`).
+  - To spawn there, type that name into **Active Point Id** on the `SpawnPoints` manager. Blank means
+    "first by name".
+  - *Why: this is the whole point of the change — change where you start by moving or picking a
+    marker, never by editing `Templates/dreamer_<slot>.json`.*
+
+- [ ] **(Optional) Per-slot markers.**
+  - To place the two dreamers deliberately apart, author two markers with **Slot** = `0` and `1`
+    (give them the **same Id** if you also want to select them together by id).
+  - *Why: a slot-specific marker always beats a shared one for that slot.*
+
+- [ ] **(Optional, testing only) Spawn at the marker even when loading a save.**
+  - Set **Policy** = `Always` on the manager. Set it back to `New Game Only` afterwards — while it is
+    `Always`, loading a save does **not** return the dreamers to where they were saved.
+  - *Why: useful when an existing dev save has you stuck somewhere; dangerous left on.*
+
+### Playtest validation
+
+**Single client**
+
+1. Open `Action.unity`, place the `Camp` marker somewhere distinctive on the terrain (e.g. a hilltop)
+   and aim its arrow at a recognisable landmark. Save the scene.
+2. Play from `Splash` → **New Game** → finish character creation → enter Action.
+3. Watch the Console for `[GameFlowManager] Spawned slot 0 → client 0 at (…) (spawn point)`.
+
+- [x] ✅ The dreamer starts standing **on the ground at the marker**, facing the marker's arrow, and the spawn log line reads `(spawn point)` — not `(record)`.
+
+4. Stop play. Move the marker elsewhere on the terrain, deliberately leaving it floating a few metres
+   above the surface (or slightly sunk into it). Save the scene and start a New Game again.
+
+- [ ] ✅ The dreamer spawns at the new marker **standing on the terrain surface** — not hovering, not falling through — so the ground snap corrected the authored height.
+
+5. Walk a clear distance from the marker, save the game (pause menu → Save), quit to the main menu and
+   **Load Game**.
+
+- [ ] ✅ The dreamer returns to **where it was saved**, not to the marker, and the spawn log line reads `(record)`. *(Policy = `New Game Only` — saved positions win.)*
+
+6. Set **Policy** = `Always` and cold-load the same save.
+
+- [ ] ✅ The dreamer now lands at the **marker** instead. Set Policy back to `New Game Only` afterwards.
+
+7. Disable the `SpawnPoints` GameObject (or set **Policy** = `Disabled`) and start a New Game.
+
+- [ ] ✅ The dreamer spawns at the old template position from `dreamer_0.json` and the log reads `(record)` — the feature is fully opt-in, and removing it restores the previous behaviour exactly.
+
+**Two clients (MPPM — host + one virtual player)**
+
+1. Window → Multiplayer → Multiplayer Play Mode → enable one Virtual Player. Use a single shared
+   marker (**Slot** = `-1`), start a New Game as host, then join with the virtual player.
+
+- [ ] ✅ Both dreamers spawn at the marker, offset roughly 1.5 m apart along the marker's right — not intersecting, and neither standing on top of the other (the ground cast ignores dreamers).
+
+- [ ] ✅ Each client sees the *other* dreamer in the position the host reports — the spawn position replicated, with no rubber-band back to the template position on the joining client.
+
+2. Author two markers, one with **Slot** = `0` and one with **Slot** = `1`, placed far apart. Restart
+   the session and join again.
+
+- [ ] ✅ The host dreamer spawns at the `Slot 0` marker and the joining dreamer at the `Slot 1` marker.
+
+3. With both connected, save from the host, then use the host's pause-menu **Load** (warm load).
+
+- [ ] ✅ Both dreamers return to their **saved** positions and both clients agree — the markers did not hijack the warm-load path.
+
+---
+
+## Tooling — Ground snap for world placements
+
+> *(Follow-on to the spawn-point work, same session. Fixes yields spawning underground when the
+> source object's base is sunk into the terrain. No schema change — **no save reset needed**;
+> positions already in a save are left exactly as they are.)*
+
+> **What changed (code, by Claude Code):** every host-side placement into the world now resolves onto
+> the ground before it is stored.
+>
+> - **`GroundSnap`** (new, Networking, static) — the one ground resolve, shared by the dreamer spawn
+>   markers and world placement. It casts down through the position and prefers the **highest surface
+>   at or below** it (what the object would fall onto); only when there is none — the position is
+>   *inside* the terrain — does it use the **lowest surface above** it, which lifts the object out
+>   onto the surface. That ordering is deliberate: below-first keeps a drop under an overhang landing
+>   on the floor instead of teleporting onto the roof, while the above-fallback is exactly the
+>   fallen-tree-from-a-sunk-trunk case. Dreamers are never treated as ground (the probe starts above
+>   the position and would otherwise land on whoever is standing there). `PrefabFootOffset` reads a
+>   Def prefab's combined renderer bounds so the object's **base** rests on the surface rather than
+>   its pivot.
+> - **`MapEntitySync`** — new `ResolveGroundPosition(position, defId, ignoreRoot)` plus Inspector
+>   settings (**Snap To Ground**, **Ground Mask**, **Probe Above/Below**, **Ground Clearance**,
+>   **Align To Prefab Base**). Applied at every path that puts an Instance InWorld: `PlaceItem`
+>   (yields that go to the ground, craft outputs at a station), `SpawnProcessable` (**the fallen-tree
+>   case**), and the carry-drop in `ToggleCarry` — which passes its own existing visual as
+>   `ignoreRoot`, since a carried object stands in its own probe's path. Per-Def base offsets are
+>   cached. Authored in-scene nodes are **not** snapped: their position is their scene GameObject's,
+>   which is authored deliberately.
+> - **`DreamerInventorySync`** — `DropItemServerRpc` and `UnequipContainerServerRpc` route their
+>   drop-at-the-dreamer position through the same resolve, so dropping on a slope no longer leaves
+>   the item hanging at the dreamer's pivot height.
+> - **`DreamerSpawnPoints`** — its own ground snap now calls `GroundSnap` rather than a private copy,
+>   so dreamers and world objects resolve ground by identical rules.
+>
+> **Snapping happens once, at placement.** The resolved position is what gets stored, synced and
+> saved; nothing re-queries geometry afterwards, so save/revert reproduce a placement exactly and
+> existing saves are untouched.
+
+### Wiring / setup
+
+- [ ] **Let Unity generate the `.meta` for `GroundSnap.cs`.**
+  - Confirm `Assets/Game/Networking/GroundSnap.cs.meta` exists before committing.
+
+- [ ] **Check the new ground-snap settings on `MapEntitySync` in the Action scene.**
+  - Select the GameObject carrying **Map Entity Sync** and find the new **Ground snap (host-side
+    placement)** section. Defaults are: **Snap To Ground** on, **Ground Mask** `Everything`,
+    **Probe Above** `5`, **Probe Below** `100`, **Ground Clearance** `0.02`, **Align To Prefab Base** on.
+  - Set **Ground Mask** to the same layer(s) you gave `DreamerSpawnPoints` (your terrain/ground
+    colliders). *Why: with `Everything`, a tree's own trunk collider or a nearby rock can become the
+    surface a yield lands on — usually harmless, occasionally surprising.*
+  - Raise **Probe Above** if your authored objects can be sunk deeper than 5 m into the terrain;
+    lower it if you ever want a deliberately buried placement to stay buried.
+
+- [ ] **Confirm the terrain has a collider.**
+  - Unity Terrain carries a `TerrainCollider` by default. Any hand-modelled ground the dreamers walk
+    on needs a collider too, or the probe finds nothing and placements keep their raw position (the
+    previous behaviour — no error, no log).
+
+- [ ] **(Only if objects now float) Turn off Align To Prefab Base.**
+  - It measures the visual base from the Def prefab's renderer bounds. A prefab whose renderers
+    include something oversized (an effect volume, a trigger visual) will read as taller than it is
+    and hover. Either fix the prefab or untick the toggle to place by pivot.
+
+### Playtest validation
+
+**Single client**
+
+1. In the Action scene, place an authored tree/trunk node so its **base is clearly sunk into the
+   terrain** (push it down a metre or so). Enter Play and chop it down.
+
+- [ ] ✅ The fallen tree spawns **on the terrain surface**, not inside or under it, and is immediately interactable.
+
+2. Repeat on a **slope** with a tree sitting slightly *above* the ground.
+
+- [ ] ✅ The yield lands on the slope surface directly beneath it rather than hanging at the source object's height.
+
+3. Gather something that yields a ground item with a full inventory (so the yield is dropped to the
+   ground rather than delivered), or drop an item from the inventory panel while standing on a slope.
+
+- [ ] ✅ The dropped item rests on the ground at your feet — not floating, not sunk — and can be picked up again.
+
+4. Drop an item while standing on top of a placed world object (a log or rock, if one is to hand).
+
+- [ ] ✅ The item lands on the surface you are standing on, not on the terrain underneath it.
+
+5. Save, quit to menu, and load the save.
+
+- [ ] ✅ Every world item and object is exactly where it was — the snap happened once at placement and the stored position round-trips unchanged.
+
+**Two clients (MPPM — host + one virtual player)**
+
+1. With both connected, have the **client** chop down a sunk tree while the host watches.
+
+- [ ] ✅ Both clients see the fallen tree at the same place, on the surface — the host resolved the position before syncing, so no client-side correction is involved.
+
+2. Have the client drop an item on a slope.
+
+- [ ] ✅ Both clients see it resting on the ground in the same spot.

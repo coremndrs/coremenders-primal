@@ -14,6 +14,7 @@ namespace Game.Networking
 
         private void Start()
         {
+            NetworkManager.Singleton.OnClientConnectedCallback -= OnClientConnected;
             NetworkManager.Singleton.OnClientConnectedCallback += OnClientConnected;
         }
 
@@ -41,7 +42,22 @@ namespace Game.Networking
                 return;
             }
 
-            var go = Instantiate(_dreamerPrefab, record.position.ToVector3(), Quaternion.identity);
+            var spawnPos = record.position.ToVector3();
+            var spawnRot = Quaternion.identity;
+
+            // Same authored-marker path as GameFlowManager. This spawner only runs in the
+            // bootstrap/debug scene, which never loads a save — so the session always counts as
+            // "positions from template".
+            if (DreamerSpawnPoints.Instance != null &&
+                DreamerSpawnPoints.Instance.TryGetSpawnPose(
+                    slot, true, _dreamerPrefab, out var pointPos, out var pointRot))
+            {
+                spawnPos = pointPos;
+                spawnRot = pointRot;
+                record.position = spawnPos.ToFloat3();
+            }
+
+            var go = Instantiate(_dreamerPrefab, spawnPos, spawnRot);
             go.GetComponent<DreamerNetworkAdapter>().Initialize(slot);
             go.GetComponent<NetworkObject>().SpawnWithOwnership(ownerId);
             RuntimeDataManager.Instance.SetOwnership(slot, ownerId);

@@ -30,6 +30,14 @@ namespace Game.Networking
 
         private bool _shouldDoFirstDream; // set only by StartGame (new session); not set by BeginLoad
 
+        /// <summary>
+        /// True while the dreamer positions held by the RDM are template defaults rather than
+        /// positions a player actually stood on. Set by BeginHost (New Game), cleared by any path
+        /// that applies a save (BeginLoad / LoadGame / revert). <see cref="DreamerSpawnPoints"/>
+        /// reads it so authored markers place a new session without hijacking a loaded one.
+        /// </summary>
+        private bool _positionsFromTemplate;
+
         private void Awake()
         {
             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
@@ -48,6 +56,7 @@ namespace Game.Networking
         public void BeginHost()
         {
             var (world, mapLayer) = TemplateLoader.Load();
+            _positionsFromTemplate = true; // authored spawn markers may place this session
             RuntimeDataManager.Instance.Populate(world);
             RuntimeDataManager.Instance.SetMapLayer(mapLayer);
 
@@ -77,6 +86,7 @@ namespace Game.Networking
 
             var (world, mapLayer) = SaveSystem.LoadSlot(slot);
             world.clock?.Resume(); // always start running after a cold load
+            _positionsFromTemplate = false; // saved positions win over spawn markers
             RuntimeDataManager.Instance.Populate(world);
             RuntimeDataManager.Instance.SetMapLayer(mapLayer);
             SaveSystem.DiscardCheckpointsNewerThan(world.clock?.totalInGameMinutes ?? 0f); // c4
@@ -185,6 +195,7 @@ namespace Game.Networking
             }
 
             var (world, mapLayer) = SaveSystem.LoadSlot(slot);
+            _positionsFromTemplate = false; // saved positions win over spawn markers
             RuntimeDataManager.Instance.Populate(world);
             RuntimeDataManager.Instance.SetMapLayer(mapLayer);
             SaveSystem.DiscardCheckpointsNewerThan(world.clock?.totalInGameMinutes ?? 0f); // c4
@@ -435,6 +446,20 @@ namespace Game.Networking
             var buffConfig  = driver?.BuffConfig  ?? new BuffConfig();
             var needsConfig = driver?.NeedsConfig ?? new NeedsConfig();
 
+            // Wake resets the trivial bracket to its daily base (§5.5.5, 0.2.11d4). Done for EVERY
+            // waker, before the min-bank filter below: the bracket is about the new day, not about
+            // whether the sleep was long enough to earn a checkpoint.
+            //
+            // The reset is an assignment, not an addition — that is what makes unspent bracket
+            // minutes expire at sleep. Otherwise a player could bank idle-skip conversions night
+            // after night and turn the bounded bracket into a second, unbounded day pool.
+            foreach (var w in wakers)
+            {
+                var d = RuntimeDataManager.Instance?.GetDreamer(w.DreamerSlot);
+                if (d == null) continue;
+                d.trivialBracket = needsConfig.trivialBracketDailyBase;
+            }
+
             // Filter to dreamers who slept at least the minimum threshold.
             var qualifying = new List<SleepEndedResult>();
             foreach (var w in wakers)
@@ -536,18 +561,34 @@ namespace Game.Networking
                 return;
             }
 
-            var savedPos = record.position.ToVector3();
-            var go = Instantiate(_dreamerPrefab, savedPos, Quaternion.identity);
+            var spawnPos = record.position.ToVector3();
+            var spawnRot = Quaternion.identity;
+            var source   = "record";
+
+            // Authored scene markers override the record's position on a fresh session (and, if the
+            // scene's policy says so, always). Writing the result back into the record keeps the
+            // RDM, the save and the body in agreement from the first frame.
+            if (DreamerSpawnPoints.Instance != null &&
+                DreamerSpawnPoints.Instance.TryGetSpawnPose(
+                    slot, _positionsFromTemplate, _dreamerPrefab, out var pointPos, out var pointRot))
+            {
+                spawnPos = pointPos;
+                spawnRot = pointRot;
+                source   = "spawn point";
+                record.position = spawnPos.ToFloat3();
+            }
+
+            var go = Instantiate(_dreamerPrefab, spawnPos, spawnRot);
             go.GetComponent<DreamerNetworkAdapter>().Initialize(slot);
             go.GetComponent<NetworkObject>().SpawnWithOwnership(ownerId);
             rdm.SetOwnership(slot, ownerId);
 
-            // D5: authority override — snap the owner to the saved position.
+            // D5: authority override — snap the owner to the resolved position.
             // For host-owned dreamers this runs locally; for client-owned dreamers
             // the [Rpc(SendTo.Owner)] delivers it to the owning client.
-            go.GetComponent<DreamerNetworkAdapter>().SnapToPositionRpc(savedPos);
+            go.GetComponent<DreamerNetworkAdapter>().SnapToPositionRpc(spawnPos);
 
-            Debug.Log($"[GameFlowManager] Spawned slot {slot} → client {ownerId} at {savedPos}");
+            Debug.Log($"[GameFlowManager] Spawned slot {slot} → client {ownerId} at {spawnPos} ({source})");
         }
 
         // ── Helpers ──────────────────────────────────────────────────────────────
