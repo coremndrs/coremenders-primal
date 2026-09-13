@@ -94,7 +94,7 @@ Take additional archives whenever convenient (daily, or after a heavy art sessio
 ### Setup
 
 ```
-restic init --repo E:\CoremendersBackup
+restic init --repo G:\CoremendersBackup
 ```
 
 Set `RESTIC_PASSWORD` (or `RESTIC_PASSWORD_FILE`) in the environment. **Store the password somewhere outside the backup** — a lost restic password means an unrecoverable repository. A password manager, not a file in the project.
@@ -102,7 +102,7 @@ Set `RESTIC_PASSWORD` (or `RESTIC_PASSWORD_FILE`) in the environment. **Store th
 ### Taking a snapshot
 
 ```
-restic -r E:\CoremendersBackup backup C:\Projects\Coremenders ^
+restic -r G:\CoremendersBackup backup "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost" ^
   --exclude Library --exclude Temp --exclude Obj ^
   --exclude Logs --exclude Build --exclude UserSettings ^
   --tag build-0.2.3
@@ -113,7 +113,7 @@ restic -r E:\CoremendersBackup backup C:\Projects\Coremenders ^
 ### Retention
 
 ```
-restic -r E:\CoremendersBackup forget --keep-tag build --keep-daily 7 --keep-weekly 8 --prune
+restic -r G:\CoremendersBackup forget --keep-tag build --keep-daily 7 --keep-weekly 8 --prune
 ```
 
 `--keep-tag build` is doing the important work: it protects every build-boundary snapshot from pruning regardless of age. Ordinary snapshots roll off.
@@ -133,8 +133,8 @@ Backblaze B2 runs a few dollars a month at this scale — less than the LFS data
 ## Restore Procedure
 
 ```
-restic -r E:\CoremendersBackup snapshots
-restic -r E:\CoremendersBackup restore <snapshot-id> --target C:\Restore\Coremenders
+restic -r G:\CoremendersBackup snapshots
+restic -r G:\CoremendersBackup restore <snapshot-id> --target C:\Restore\Coremenders
 ```
 
 Open the restored folder in Unity 6 LTS. Unity rebuilds `Library/` on first open — expect a long import.
@@ -155,7 +155,7 @@ Backup schemes fail silently. Run the full restore-and-verify once immediately a
 ## Integrity
 
 ```
-restic -r E:\CoremendersBackup check
+restic -r G:\CoremendersBackup check
 ```
 
 Run occasionally — it verifies repository structure and catches bit rot before you need the data.

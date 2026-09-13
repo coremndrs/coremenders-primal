@@ -2856,12 +2856,48 @@ machine-local configuration, so it falls to you.
     merge and will corrupt the YAML. This is local config — it is not versioned, so
     every machine that clones the repo must repeat it.
 
-- [ ] **Install restic and initialise the primary archive repo** per
-  `Docs/VersionControl.md`.
-  - Store the restic password in a password manager — **not** in the project folder,
-    and not only inside the backup it protects.
+- [x] **Install restic.** Done — `winget install restic.restic`, restic **0.19.1** at
+  `%LOCALAPPDATA%\Microsoft\WinGet\Links\restic.exe`. A **new** terminal is needed before
+  `restic` resolves on PATH.
+
+- [ ] **Set the repository password, then initialise the primary archive repo at
+  `G:\CoremendersBackup`.** Run these yourself — the password must not pass through a
+  transcript or land in the project folder. Three lines in a fresh PowerShell:
+  ```powershell
+  # 1. Create a strong passphrase, store it in your password manager FIRST, then:
+  $pw = Read-Host "restic repo password" -AsSecureString
+  [System.IO.File]::WriteAllText("$env:USERPROFILE\.config\restic\coremenders.txt",
+      [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+      [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw)),
+      (New-Object Text.UTF8Encoding $false))
+
+  # 2. Point restic at the repo + password file, persistently for your user
+  [Environment]::SetEnvironmentVariable("RESTIC_REPOSITORY", "G:\CoremendersBackup", "User")
+  [Environment]::SetEnvironmentVariable("RESTIC_PASSWORD_FILE",
+      "$env:USERPROFILE\.config\restic\coremenders.txt", "User")
+
+  # 3. New terminal, then:
+  restic init
+  ```
+  - `$env:USERPROFILE\.config\restic\` is outside both the project folder and the backup,
+    which is what the rule asks for. It is still a plaintext file on this machine — the
+    password manager copy is the one that survives a disk loss, so do step 1 in that order.
   - *Why:* heavy binaries are gitignored by design, so a `git clone` alone does not
-    yield a runnable project. The archive is the other half of the recovery story.
+    yield a runnable project. The archive is the other half of the recovery story. **The
+    125 Island01 terrain tiles (~68 MB) currently exist only in the working folder** —
+    not in git, not in any archive.
+
+- [ ] **Take the first snapshot** once the repo is initialised.
+  ```powershell
+  restic backup "F:\Latest\Coremenders - Primal Frost\Coremenders - Primal Frost" `
+    --exclude Library --exclude Temp --exclude Obj `
+    --exclude Logs --exclude Build --exclude UserSettings `
+    --tag terrain-island01
+  restic snapshots
+  ```
+  - Record the snapshot ID here once it completes.
+  - *Why:* `.git/` is deliberately **included** — that is what makes a snapshot a
+    self-contained project rather than half of one.
 
 - [ ] **Initialise the second, off-site archive destination.** One local, one remote.
   - *Why:* a single archive on the same machine as the project is not a backup.
@@ -3057,10 +3093,10 @@ machine-local configuration, so it falls to you.
 
 ### Wiring / setup
 
-- [ ] **Let Unity generate the `.meta` for `GroundSnap.cs`.**
+- [x] **Let Unity generate the `.meta` for `GroundSnap.cs`.**
   - Confirm `Assets/Game/Networking/GroundSnap.cs.meta` exists before committing.
 
-- [ ] **Check the new ground-snap settings on `MapEntitySync` in the Action scene.**
+- [x] **Check the new ground-snap settings on `MapEntitySync` in the Action scene.**
   - Select the GameObject carrying **Map Entity Sync** and find the new **Ground snap (host-side
     placement)** section. Defaults are: **Snap To Ground** on, **Ground Mask** `Everything`,
     **Probe Above** `5`, **Probe Below** `100`, **Ground Clearance** `0.02`, **Align To Prefab Base** on.
@@ -3070,7 +3106,7 @@ machine-local configuration, so it falls to you.
   - Raise **Probe Above** if your authored objects can be sunk deeper than 5 m into the terrain;
     lower it if you ever want a deliberately buried placement to stay buried.
 
-- [ ] **Confirm the terrain has a collider.**
+- [x] **Confirm the terrain has a collider.**
   - Unity Terrain carries a `TerrainCollider` by default. Any hand-modelled ground the dreamers walk
     on needs a collider too, or the probe finds nothing and placements keep their raw position (the
     previous behaviour — no error, no log).
